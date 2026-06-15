@@ -1,0 +1,9 @@
+# FIU Minute Bar Generator - Python Dependencies
+# This project uses only the Python standard library.
+# No third-party packages required.
+
+# Runtime: Python >= 3.8
+# All files use `from __future__ import annotations` for PEP 563 deferred evaluation
+
+# Development dependencies (optional)
+pytest>=7.0

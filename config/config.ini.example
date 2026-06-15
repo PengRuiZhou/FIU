@@ -1,0 +1,56 @@
+# FIU Minute Bar Generator — 配置模板
+# 复制为 production.ini 或 test-xxx.ini 后修改
+
+[input]
+csv_dir = /path/to/input
+# target_date =               # 可选，不设置则用当天 JST 日期
+poll_interval_ms = 200
+idle_poll_interval_ms = 5000
+buffer_poll_interval_ms = 1000
+chunk_size_bytes = 65536
+file_encoding = utf-8
+
+[output]
+output_dir = /path/to/output
+format = csv
+enable_kline = false
+enable_full_snapshot = true
+enable_full_kline = false
+enable_order = true
+
+[aggregation]
+first_seen_volume_base = start_totalvol
+
+[timezone]
+exchange_tz = Asia/Tokyo
+local_tz = Asia/Shanghai
+
+[session]
+morning_open = 0900
+morning_close = 1130
+afternoon_open = 1230
+afternoon_close = 1500
+pre_market_start = 0800
+post_market_end = 1530
+
+[recovery]
+checkpoint_file = checkpoint.json
+output_delay_sec = 5
+code_refresh_sec = 30
+data_flush_delay_minutes = 1
+enable_time_fallback = false
+stall_flush_sec = 300
+# Maximum late order records per minute before discarding.
+# Applies to ALL modes (live, replay, tickfile enabled or disabled).
+# Default: 1000000 (1M). Each record uses ~300-400 bytes of Python memory.
+# At 1M records this is ~400 MB per minute. Multiple minutes accumulating
+# simultaneously could reach 2-3 GB total. Monitor memory if adjusting.
+# Production: rarely exceeds 1000 late records per minute.
+# 100x test: busiest minute has ~750K records.
+max_late_order_records_per_minute = 1000000
+
+[logging]
+error_log_dir = errors/
+max_file_size_mb = 100
+max_backup_count = 5
+log_level = INFO

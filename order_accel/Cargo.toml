@@ -1,0 +1,18 @@
+[package]
+name = "order-accel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+
+[lib]
+name = "_order_accel"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.0", features = ["extension-module"] }
+indexmap = "1.9"
+crc32fast = "1"
+lazy_static = "1.4"
+
+[profile.release]
+panic = "abort"  # Terminate process on panic — safer than undefined state for financial data

@@ -1,0 +1,50 @@
+name: Build Rust Order Acceleration
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'order_accel/**'
+      - 'ci/build-rust.yml'
+      - 'tests/test_schema_hash_parity.py'
+  pull_request:
+    paths:
+      - 'order_accel/**'
+      - 'ci/build-rust.yml'
+      - 'tests/test_schema_hash_parity.py'
+
+jobs:
+  test:
+    name: Test on ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, manylinux-x86_64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: order_accel
+
+      - name: Stage 1: Rust unit tests
+        run: |
+          cd order_accel
+          cargo test --all
+
+      - name: Stage 2: Python integration tests
+        run: |
+          python -m pytest tests/test_order_batch_golden.py tests/test_snapshot_ohlcv_golden.py tests/test_tickfile_rust_golden.py tests/test_order_accel.py -v
+
+      - name: Stage 2: Schema hash parity check
+        run: |
+          python -m pytest tests/test_schema_hash_parity.py -v

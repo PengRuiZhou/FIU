@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Test data directories
+test/output/
+test/concurrent_bench_output/
+test/errors/
+test/errors_replay/
+test/tickfile_live_output/
+test/*.log
+test/*.txt
+
+# Input data (DO NOT COMMIT)
+input/
+
+# Rust build artifacts
+order_accel/target/
+*.pyd
+*.so
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data files
+*.csv
+*.parquet

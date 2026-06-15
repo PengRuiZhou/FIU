@@ -1,0 +1,14 @@
+{
+  "version": 3,
+  "date": "",
+  "last_seqno": 0,
+  "output_minutes": [],
+  "last_output_minute": "",
+  "current_minute": "",
+  "last_output_date": "",
+  "first_data_received": false,
+  "last_update_time": "2026-06-11T15:14:18.781592+09:00",
+  "files": {},
+  "last_totalvol_by_symbol": {},
+  "last_totalamount_by_symbol": {}
+}

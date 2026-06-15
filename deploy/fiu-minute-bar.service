@@ -1,0 +1,30 @@
+[Unit]
+Description=FIU Minute Bar Generator
+After=network.target
+
+[Service]
+Type=simple
+User=rpeng
+WorkingDirectory=/home/rpeng/fiu_minute_bar
+ExecStart=/home/prod/anaconda3/bin/python main.py --config config/production.ini
+
+# Graceful shutdown: SIGTERM → 30s → SIGKILL
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Auto restart on failure (not on clean exit)
+Restart=on-failure
+RestartPreventExitStatus=2 3 4
+RestartSec=30
+
+# Prevent restart loops
+StartLimitInterval=600
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fiu-minute-bar
+
+[Install]
+WantedBy=multi-user.target
