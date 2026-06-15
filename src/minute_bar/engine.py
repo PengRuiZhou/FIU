@@ -27,6 +27,8 @@ from minute_bar.csv_parser import _rust_parse_batch
 # Phase 21 imports
 from minute_bar.csv_parser import (
     use_phase21_order_batch,
+    use_phase21_snapshot_batch,
+    use_phase21_tickfile,
     decode_order_per_minute_buf,
     decode_late_order_buf,
     decode_latest_order_buf,
