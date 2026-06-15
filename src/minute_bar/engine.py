@@ -825,6 +825,52 @@ class Engine:
 
         return (seqno, total_late_dropped, current_date, current_minute)
 
+    def _write_late_orders_batch(
+        self,
+        decoded_late: List[OrderRecord],
+        output_dir: str,
+        pending_shared_orders: list,
+    ) -> None:
+        """Write Phase 21 late orders to disk, grouped by minute_key.
+
+        Phase 21's Rust pipeline routes already-flushed-minute orders into
+        ``late_order_buf``; this method decodes that buffer (done by the caller)
+        and persists the records. Each minute gets ONE write call (batch append
+        or create) rather than one ``open()`` per record — the per-record path
+        deadlocks the order thread on file I/O during the 0900 open peak.
+
+        Invariants (spec §6.1):
+          - Same file target: each record still reaches its minute's order file.
+          - Same intra-minute order: records keep ``decode_late_order_buf`` order.
+          - ``_late_order_count`` += 1 per record (counted in the grouping pass).
+          - ``_late_order_minutes`` accumulates every touched minute.
+          - Tickfile routing: each record appended to ``pending_shared_orders``
+            with the ``__LATE__`` marker when tickfile output is enabled.
+          - append/create decision unchanged: file exists → append, else → create.
+        """
+        if not decoded_late:
+            return
+
+        enable_tickfile = self._config.output.enable_tickfile
+
+        # Group by minute_key while preserving per-minute insertion order.
+        late_by_minute: Dict[str, List[OrderRecord]] = {}
+        for rec in decoded_late:
+            mk = str(rec.time)[:12]
+            self._late_order_count += 1
+            self._late_order_minutes.add(mk)
+            late_by_minute.setdefault(mk, []).append(rec)
+            if enable_tickfile:
+                pending_shared_orders.append(("__LATE__", rec))
+
+        # One write call per minute instead of one per record.
+        for late_mk, batch in late_by_minute.items():
+            path = get_order_file_path(output_dir, late_mk)
+            if os.path.exists(path):
+                append_order_records(path, batch)
+            else:
+                write_order_file(output_dir, late_mk, batch)
+
     def _order_loop(self) -> None:
         if not self._config.output.enable_order:
             return
@@ -929,19 +975,13 @@ class Engine:
                                         if minute_key_for_record in self._flushed_order_minutes:
                                             pending_shared_orders.append(("__LATE__", rec))
 
-                                # Decode late_order_buf — write late orders directly to files
+                                # Decode late_order_buf — write late orders to files
+                                # (grouped per minute via _write_late_orders_batch to avoid
+                                #  one open() per record; see spec 2026-06-15-late-order-batch-write-fix)
                                 decoded_late = decode_late_order_buf(late_order_buf)
-                                for rec in decoded_late:
-                                    self._late_order_count += 1
-                                    self._late_order_minutes.add(str(rec.time)[:12])
-                                    late_mk = str(rec.time)[:12]
-                                    path = get_order_file_path(output_dir, late_mk)
-                                    if os.path.exists(path):
-                                        append_order_records(path, [rec])
-                                    else:
-                                        write_order_file(output_dir, late_mk, [rec])
-                                    if self._config.output.enable_tickfile:
-                                        pending_shared_orders.append(("__LATE__", rec))
+                                self._write_late_orders_batch(
+                                    decoded_late, output_dir, pending_shared_orders,
+                                )
 
                                 # Decode latest_order_buf → atomically update SharedState
                                 decoded_latest = decode_latest_order_buf(latest_order_buf)
