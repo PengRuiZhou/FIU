@@ -1,10 +1,30 @@
 # Tickfile Shutdown Stale-Row Persistence（待修复）
 
 > **Date**: 2026-06-15
-> **Status**: 根因已定位，修复方案待定（需 design review）
+> **Status**: 根因已定位 + 决定性验证完成；修复方案待定（需 design review），低优先级
 > **Parent**: `docs/superpowers/specs/2026-06-15-phase21-late-order-batch-write-fix.md`
 > **发现方式**: `test/phase21_benchmark/full_day_run.py`（全天诊断）+ 代码级恢复路径审查
 > **严重度**: 实时生产下影响小（gap≈0-1 分钟），但残留行永久不修复，数据完整性隐患
+
+---
+
+## 0. 根因决定性验证（2026-06-15，不截断全天运行）
+
+让 order 自然跑到 1530 EOF 后才停（order=snapshot=1530, `lag=sync`, `reached_eof=True`）：
+
+```
+order reached 202605281530 (+732.0s)  [snapshot=202605281530, lag=sync]
+Shutdown CHECK 3 PASS: tickfile complete (329 minutes match snapshot&order intersection)
+Tickfile shutdown summary: enqueue=422, dequeue=422, generated=329, missing=0
+```
+
+对比截断运行（benchmark 420s / 诊断 900s）：
+- 截断：`CHECK 3 WARN: 198/50 tickfile minutes EXTRA (no snapshot+order)`，stale 冻结行
+- 不截断：`CHECK 3 PASS`，**0 EXTRA，0 missing**，symbol 1311 bid 在 14:51–15:06 每次采样变化
+
+**结论：stale 行的唯一原因是"停止时 order < snapshot"。order 到 EOF 则 0 stale。**
+这把问题从"引擎 bug"收窄为"停止时机的数据完整性问题"——实时生产吞吐充足（7x 余量），
+正常停止 gap≈0-1 分钟，仅崩溃/资源耗尽时 order 大幅落后才放大。
 
 ---
 
