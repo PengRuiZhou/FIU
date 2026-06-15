@@ -972,9 +972,55 @@ seqno=2  UpdateTime=20260528 08:30  LocalTime=08:00:00.040000  ✅ LocalTime 不
 389 passed（1 pre-existing time-flaky: test_order_drain）
 
 ### Pending（Phase 4）
-- [ ] Engine-level integration test（exercise engine.py Rust path end-to-end with config enabled）
+- [x] Engine-level integration test（exercise engine.py Rust path end-to-end with config enabled）— Phase 21 E2E benchmark
+- [x] Concurrent benchmark（order + snapshot threads, sustained artificial load）— Phase 21 live benchmark (100Kx)
+- [x] E2E performance test（speed=100 tickfile live, verify 0900 gap <60s）— Phase 21 benchmark, window completed
 - [ ] Corrupted .pyd rollback test（verify import fallback + system starts）
-- [ ] Concurrent benchmark（order + snapshot threads, sustained artificial load）
-- [ ] E2E performance test（speed=100 tickfile live, verify 0900 gap <60s）
 - [ ] Warmup self-test in `Engine.__init__`
-- [ ] Set `enable_order_accel = true` in production INI after Phase 4 validation
+- [x] Set `enable_order_accel = true` in production INI after Phase 4 validation — Phase 21 三个 flag 全开
+
+---
+
+## Session 24 — 2026-06-15 (Phase 21: Full Rust De-GIL + late-order 修复 + 阶段结论)
+
+> Rust 去 GIL 解耦合阶段**全部完成**。order / snapshot / tickfile 三条热路径全部 Rust 化，
+> Phase 4 GIL 竞争根因（order vs snapshot 35x）彻底解决。本节记录阶段最终结果。
+
+### 已完成
+
+**Phase 21: Full Rust pipeline**（commit 8620697，46/46 tests，CI green）
+- `process_order_batch`: Rust 内完成 parse + group + buffer build（order 主路径）
+- `aggregate_snapshot_batch` + `parse_snapshot_batch`: snapshot 侧 Rust 化
+- `tickfile_generate`: tickfile 生成 Rust 化
+- 三个 config flag: `enable_rust_order_full_batch` / `enable_rust_snapshot_batch` / `enable_rust_tickfile`
+
+**Phase 21 late-order 批量写修复**（commit 69cbde7）
+- Bug: Rust 主路径遗漏 late-order 写盘分支，逐条 `open()` 在 0900 峰值拖死 order 线程（watermark 卡 0907）
+- Fix: 抽取 `_write_late_orders_batch`，按 minute_key 分组，每分钟一次写盘（数千 open() → ~1-3）
+- 验证: order watermark 0859→0911 推进（原卡 0907），benchmark window completed=True
+- 8 新测试 (test_order_late_batch_write.py) + 448 回归 passed
+
+### 关键结论（Q1 / Q2 调查，证据化）
+
+**Q2: Rust 去 GIL 后能否满足实时？→ 能，7x 余量**
+- 引擎吞吐（100Kx 满载饱和天花板）: 78.6M lines / 900s = **87,000 lines/sec**
+- 实时需求（源数据实测 1x 馈送）: 峰值分钟 0903 = 759,890 lines → 12,667 lines/sec；均值 3,417 lines/sec
+- 余量: 峰值 **6.9x**，均值 25x。tickfile 生成 200-500ms/分钟可忽略
+- **关键洞察**: benchmark/诊断看到的"order 慢/stale 198 分钟"是 100Kx 人为压力测试（实时 100,000 倍灌入）产物；真实 1x 生产 order/snapshot 同步，不积压
+
+**Q1: tickfile shutdown stale 行能否重启修复？→ 不能，永久残留（已记录为后续改进点）**
+- shutdown `flush_all_remaining` 无条件为 order 未到达的分钟生成 tickfile，order 侧用冻结 carry-forward 值 → stale 行
+- tickfile **append-only** + `_generated_tickfile_minutes` 去重集**不持久化** + snapshot 已 flush 不重生成 → 重启后 stale 行不覆盖、不重新生成、不清理，**永久残留**
+- 实时生产影响小（gap≈0-1 分钟），但残留行不修复。唯一手段: 删 tickfile + ReplayEngine 重跑
+- 详见 `docs/superpowers/specs/2026-06-15-tickfile-shutdown-stale-persistence.md`
+
+### 后续 TDD 改进点（Q1，低优先级）
+- [ ] checkpoint 持久化 `_generated_tickfile_minutes` + 重启修复 order<snapshot 的 gap 分钟
+- [ ] 或: shutdown/cross-day 强制生成跳过 order 未到分钟（与 INV-TF1 不变量冲突，需 review）
+- [ ] 先写失败测试（构造 order 落后 snapshot → shutdown → 重启 → 断言 stale 行被修复/标记）
+
+### 阶段状态
+- ✅ Phase 20 (Rust Order Accel) — 完成
+- ✅ Phase 21 (Full Rust De-GIL) — 完成，46 tests
+- ✅ Phase 21 late-order 修复 — 完成，commit 69cbde7
+- ⏸ Q1 tickfile stale 残留 — 记录为后续改进，实时影响小

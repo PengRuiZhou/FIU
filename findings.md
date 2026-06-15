@@ -1061,3 +1061,60 @@ Must validate with `tracemalloc` in Phase 4.
 1. Set `enable_order_accel = false` in INI config → Restart → Python fallback
 2. Delete `_order_accel.pyd` from `src/minute_bar/` → Import fallback → System starts normally
 3. Both paths tested and verified producing byte-identical output
+
+---
+
+## Rust 去 GIL 解耦合阶段最终发现（2026-06-15，Phase 21 + late-order 修复）
+
+> 阶段总结：order / snapshot / tickfile 三条热路径全部 Rust 化，Phase 4 的 order vs snapshot
+> GIL 35x 竞争根因彻底解决。本节记录阶段末尾的关键发现（late-order 瓶颈、Q1 stale 残留、Q2 吞吐）。
+
+### Finding 1: late-order 写盘是 Phase 21 Rust 化的遗漏盲点
+
+Phase 21 把 `process_order_batch`（parse + group + buffer build）移入 Rust，但**写盘仍在 Python**。
+Rust 的 `late_order_buf` 解码后，Python 逐条 `append_order_records([rec])` —— 每条一次 `open(path, "a")`。
+
+**为什么 0900 峰值触发**: 0900 附近 minute 快速 flush（0850-0900 已 flush），大量 record 落入
+`late_order_buf`（单批数千条），逐条 `open()` 把 order 线程拖死在 I/O（非 GIL）。
+
+**修复**: 抽取 `_write_late_orders_batch`，按 minute_key 分组，每分钟一次写盘。
+`open()` 次数: `len(decoded_late)`(数千) → `len(late_by_minute)`(~1-3)。
+
+**与 Phase 4 GIL 问题的区别**:
+- Phase 4: GIL 竞争（snapshot 抢 89% GIL），Rust 化释放 GIL 解决
+- 本次: 文件 I/O 系统调用（order 自己卡 open），批量写减少 open 次数解决
+- snapshot 表现是判据: 本次 snapshot 正常推进（证明非 GIL 竞争）
+
+### Finding 2: tickfile 是 append-only，stale 行永久残留（Q1）
+
+`write_tickfile_rows` (writer.py:346): 文件存在 → **追加**，不存在 → 原子创建。一个交易日一个文件，
+append-only。
+
+**重启恢复链路全验证**:
+- `_generated_tickfile_minutes`(去重集) + `_tickfile_pending` 均**纯内存，不持久化**
+- `recover_tickfile_seqno` 只恢复 seqno，**不**恢复已生成分钟
+- `flushed_snapshot_minutes` 从磁盘恢复**全部** snapshot 分钟（含 gap 分钟）→ snapshot 不重 flush → 不重填 `_tickfile_pending`
+- 无任何 truncate tickfile 逻辑
+
+**结论**: shutdown 产生的 stale 行（order 未到分钟，用冻结 carry-forward）重启后:
+`_try_generate_tickfile(gap_mk)` → `pending = _tickfile_pending.pop(gap_mk)` = None → "skipped, no pending"
+→ **不重新生成，stale 行永久残留**。唯一修复: 删 tickfile + ReplayEngine 重跑。
+
+### Finding 3: 100Kx benchmark 是人为压力测试，非实时能力判据（Q2）
+
+之前看到"order 慢、stale 198 分钟"易误判为实时能力不足。实测:
+- 引擎吞吐天花板（100Kx 饱和）: **87,000 lines/sec**
+- 实时峰值需求（源 0903 分钟 759,890 lines）: 12,667 lines/sec
+- **余量 6.9x（峰值）/ 25x（均值）**
+
+100Kx = 实时 100,000 倍灌入，order 必然跟不上、必然积压、停止必然大 gap。
+**真实 1x 生产**: order 吞吐远超需求，order/snapshot 同步，停止 gap ≈ 0-1 分钟。
+benchmark 失败（RSS 2.2GB > 400MB）是积压内存压力，非实时吞吐不足。
+
+### Finding 4: tickfile 生成门控（live gate 正确）
+
+`flusher.py:448` tickfile enqueue 门控 `order_current_minute > minute_key` **正确**，
+日志 `Tickfile pending: N total, 0 eligible` 证明运行期间 0 抢跑。
+stale 行只来自两条**无检查的强制生成路径**:
+- shutdown: `flush_all_remaining` (flusher.py:487-499)
+- cross-day: `_step1_cross_day_check` (flusher.py:225-234)

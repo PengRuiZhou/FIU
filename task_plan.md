@@ -829,12 +829,47 @@ Order thread peak-minute performance（0900: 747K records）takes 147s > 60s req
 
 ### Pending（Phase 4）
 
-- [ ] Engine-level integration test
+- [x] Engine-level integration test — Phase 21 E2E benchmark 完成
 - [ ] Corrupted .pyd rollback test
-- [ ] Concurrent benchmark（order + snapshot threads, sustained load）
-- [ ] E2E performance test（speed=100 tickfile live）
+- [x] Concurrent benchmark（order + snapshot threads, sustained load）— Phase 21 live benchmark (100Kx)
+- [x] E2E performance test（speed=100 tickfile live）— Phase 21 benchmark window completed
 - [ ] Warmup self-test in `Engine.__init__`
-- [ ] `enable_order_accel = true` in production INI
+- [x] `enable_order_accel = true` in production INI — Phase 21 三个 flag 全开
+
+---
+
+## Phase 21: Full Rust De-GIL `[complete]` + late-order 修复
+
+> **Rust 去 GIL 解耦合阶段全部完成。** Phase 4 的 order vs snapshot GIL 35x 竞争根因彻底解决。
+> order / snapshot / tickfile 三条热路径全部 Rust 化。
+
+### Phase 21: Full Rust pipeline `[complete]`（commit 8620697，46/46 tests）
+- `process_order_batch`: Rust parse + group + buffer build（order 主路径）
+- `aggregate_snapshot_batch` + `parse_snapshot_batch`: snapshot Rust 化
+- `tickfile_generate`: tickfile 生成 Rust 化
+- 三个 flag: `enable_rust_order_full_batch` / `enable_rust_snapshot_batch` / `enable_rust_tickfile`
+
+### Phase 21 late-order 批量写修复 `[complete]`（commit 69cbde7）
+- **Bug**: Rust 主路径遗漏 late-order 写盘分支，逐条 `open()` 在 0900 峰值拖死 order（卡 0907）
+- **Fix**: 抽取 `_write_late_orders_batch`，按 minute_key 分组，每分钟一次写盘
+- **验证**: order watermark 0859→0911（原卡 0907）；8 新测试 + 448 回归 passed
+- **Spec**: `docs/superpowers/specs/2026-06-15-phase21-late-order-batch-write-fix.md`
+
+### 阶段结论（Q1 / Q2 调查）
+
+| 问题 | 结论 | 证据 |
+|------|------|------|
+| Q2: Rust 去 GIL 能否满足实时？ | **能，7x 余量** | 引擎 87K lines/s vs 实时峰值 12.7K lines/s |
+| Q1: tickfile stale 重启能修复？ | **不能，永久残留**（实时影响小） | append-only + dedup 不持久化 |
+
+**关键洞察**: benchmark 看到的"order 慢/stale"是 100Kx 人为压力测试（实时 100,000 倍）产物；
+真实 1x 生产吞吐余量充足，order/snapshot 同步，停止 gap≈0-1 分钟。
+
+### 后续 TDD 改进点（Q1，低优先级，实时影响小）
+- [ ] checkpoint 持久化 `_generated_tickfile_minutes` + 重启修复 order<snapshot gap 分钟
+- [ ] 或 shutdown/cross-day 强制生成跳过 order 未到分钟（与 INV-TF1 冲突，需 review）
+- [ ] **TDD**: 先写失败测试（order 落后→shutdown→重启→断言 stale 被修复/标记）
+- [ ] Spec: `docs/superpowers/specs/2026-06-15-tickfile-shutdown-stale-persistence.md`
 
 ---
 

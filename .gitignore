@@ -14,7 +14,7 @@ test/*.txt
 
 # Input data (DO NOT COMMIT)
 input/
-
+test/
 # Rust build artifacts
 order_accel/target/
 *.pyd
