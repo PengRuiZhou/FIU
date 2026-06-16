@@ -193,13 +193,13 @@ class TestAggregateSnapshotBatchGolden:
             [record], "202605280859", [], [], []
         )
 
-        assert new_minute == "202605280900"
+        assert new_minute == "202605280901"
         assert len(late_keys) == 0
 
         # Decode and verify OHLCV
         decoded = _decode_ohlcv_buf(ohlcv_buf)
-        assert "202605280900" in decoded
-        entries = decoded["202605280900"]
+        assert "202605280901" in decoded
+        entries = decoded["202605280901"]
         assert len(entries) == 1
         assert entries[0]['symbol'] == "7203"
         assert abs(entries[0]['open'] - 45900.0) < 1e-6
@@ -231,7 +231,7 @@ class TestAggregateSnapshotBatchGolden:
         )
 
         decoded = _decode_ohlcv_buf(ohlcv_buf)
-        entries = decoded["202605280900"]
+        entries = decoded["202605280901"]
         assert len(entries) == 1  # 1 symbol
         e = entries[0]
         assert abs(e['open'] - 45900.0) < 1e-6   # first open
@@ -254,7 +254,7 @@ class TestAggregateSnapshotBatchGolden:
         parsed1, _ = parse_snapshot_batch(lines1, "utf-8")
         result1 = aggregate_snapshot_batch(parsed1, "202605280859", [], [], [])
         decoded1 = _decode_ohlcv_buf(result1[0])
-        assert "202605280900" in decoded1
+        assert "202605280901" in decoded1
 
         # Second minute with base values from first
         lines2 = [
@@ -267,7 +267,7 @@ class TestAggregateSnapshotBatchGolden:
 
         result2 = aggregate_snapshot_batch(parsed2, result1[1], base_vol, base_amt, [])
         decoded2 = _decode_ohlcv_buf(result2[0])
-        entries = decoded2["202605280901"]
+        entries = decoded2["202605280902"]
         assert len(entries) == 1
         # Volume should be delta: 1600 - 1000 = 600 (if base_vol properly applied)
         # Note: actual volume depends on how Rust carries forward
@@ -285,15 +285,15 @@ class TestAggregateSnapshotBatchGolden:
         ]
         parsed, _ = parse_snapshot_batch(lines, "utf-8")
 
-        # 202605280900 is already flushed
+        # Round-up: input 0900 → key 0901 (flushed)
         ohlcv_buf, new_minute, _, _, late_keys = aggregate_snapshot_batch(
-            parsed, "202605280859", [], [], ["202605280900"]
+            parsed, "202605280859", [], [], ["202605280901"]
         )
 
-        assert "202605280900" in late_keys
+        assert "202605280901" in late_keys
         # OHLCV buffer should be empty (late record skipped)
         decoded = _decode_ohlcv_buf(ohlcv_buf)
-        assert "202605280900" not in decoded
+        assert "202605280901" not in decoded
 
     def test_empty_batch(self):
         """Test with empty record list."""
@@ -325,7 +325,7 @@ class TestAggregateSnapshotBatchGolden:
         ohlcv_buf, _, _, _, _ = aggregate_snapshot_batch(parsed, "202605280859", [], [], [])
 
         decoded = _decode_ohlcv_buf(ohlcv_buf)
-        entries = decoded["202605280900"]
+        entries = decoded["202605280901"]
 
         for e in entries:
             assert abs(e['open'] - round(e['open'], 6)) < 1e-6

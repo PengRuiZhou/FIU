@@ -376,9 +376,9 @@ class TestProcessOrderBatchGolden:
 
         assert py_skipped == skipped
 
-        # Check minute_key
-        assert "202605280900" in rust_per_minute
-        assert len(rust_per_minute["202605280900"]) == 2  # 2 symbols
+        # Check minute_key (round-up: input 0900 → key 0901)
+        assert "202605280901" in rust_per_minute
+        assert len(rust_per_minute["202605280901"]) == 2  # 2 symbols
 
         # Check latest per symbol
         for sym in ["7203", "7204"]:
@@ -419,8 +419,8 @@ class TestProcessOrderBatchGolden:
         assert skipped == 3, f"Expected 3 skipped, got {skipped}"
 
         rust_per_minute = _decode_per_minute_buf(per_minute_buf)
-        assert "202605280900" in rust_per_minute
-        assert len(rust_per_minute["202605280900"]) == 2
+        assert "202605280901" in rust_per_minute
+        assert len(rust_per_minute["202605280901"]) == 2
 
     def test_late_order_routing(self):
         """Test that orders for flushed minutes are routed to late_order_buf."""
@@ -435,8 +435,8 @@ class TestProcessOrderBatchGolden:
         ]
         today = "20260528"
 
-        # 0900 is flushed, 0901 is not
-        flushed = ["202605280900"]
+        # Round-up: input 0900 → key 0901 (late), input 0901 → key 0902 (not flushed)
+        flushed = ["202605280901"]
 
         per_minute_buf, late_buf, latest_buf, late_keys, skipped = process_order_batch(
             lines, "utf-8", today, 20260528, 0, flushed
@@ -447,14 +447,14 @@ class TestProcessOrderBatchGolden:
         rust_per_minute = _decode_per_minute_buf(per_minute_buf)
         rust_late = _decode_late_order_buf(late_buf)
 
-        # 0900 should be in late_order
-        assert "202605280900" not in rust_per_minute
+        # 0901 should be in late_order (input 0900 → round-up key 0901, matches flushed)
+        assert "202605280901" not in rust_per_minute
         assert len(rust_late) == 1  # 1 late record
         assert rust_late[0].symbol == "7203"
 
-        # 0901 should be in per_minute
-        assert "202605280901" in rust_per_minute
-        assert len(rust_per_minute["202605280901"]) == 1
+        # 0902 should be in per_minute (input 0901 → round-up key 0902)
+        assert "202605280902" in rust_per_minute
+        assert len(rust_per_minute["202605280902"]) == 1
 
     def test_seqno_continuity_across_batches(self):
         """Test that seqno is global across multiple batches."""
@@ -480,8 +480,8 @@ class TestProcessOrderBatchGolden:
         # But we can verify the state is accumulating by checking raw_order_buffers size
         from minute_bar._order_accel import tickfile_get_raw_buffer
 
-        buf1 = tickfile_get_raw_buffer("202605280900")
-        # After first batch, 202605280900 buffer exists
+        buf1 = tickfile_get_raw_buffer("202605280901")
+        # After first batch, 202605280901 buffer exists (input 0900 → round-up 0901)
         assert len(buf1) > 0
 
     def test_cross_day_reset(self):
@@ -504,9 +504,9 @@ class TestProcessOrderBatchGolden:
         result2 = process_order_batch(lines2, "utf-8", "20260529", 20260529, 20260528, [])
         assert result2[4] == 0  # no skipped
 
-        # Cross-day should have cleared flushed_minutes, so 202605290900 is not late
+        # Cross-day should have cleared flushed_minutes, so 202605290901 is not late
         rust_per_minute = _decode_per_minute_buf(result2[0])
-        assert "202605290900" in rust_per_minute
+        assert "202605290901" in rust_per_minute
 
     def test_magic_bytes_valid_in_all_buffers(self):
         """Assert magic bytes are valid in all returned buffers."""

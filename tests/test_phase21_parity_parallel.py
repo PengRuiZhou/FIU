@@ -145,9 +145,9 @@ class TestPhase21Parity:
         rust1 = decode_order_per_minute_buf(result1[0])
         rust2 = decode_order_per_minute_buf(result2[0])
 
-        # All minute_keys from both batches should be present
+        # All minute_keys from both batches should be present (round-up: each input min +1)
         all_keys = set(rust1.keys()) | set(rust2.keys())
-        expected_keys = {"202605280900", "202605280901", "202605280902"}
+        expected_keys = {"202605280901", "202605280902", "202605280903"}
         assert all_keys == expected_keys, f"Keys: {all_keys} vs {expected_keys}"
 
     def test_parity_late_order_detection(self):
@@ -169,10 +169,10 @@ class TestPhase21Parity:
         result1 = process_order_batch(lines, "utf-8", today, 20260528, 0, [])
         assert result1[4] == 0  # no skipped
 
-        # Second batch: 202605280900 is now flushed
-        result2 = process_order_batch(lines, "utf-8", today, 20260528, 20260528, ["202605280900"])
+        # Second batch: 202605280901 is now flushed (input 0900 → round-up key 0901)
+        result2 = process_order_batch(lines, "utf-8", today, 20260528, 20260528, ["202605280901"])
 
-        # 0900 should be in late_order_buf
+        # 0901 should be in late_order_buf
         from minute_bar.csv_parser import decode_late_order_buf
         late_records = decode_late_order_buf(result2[1])
         assert len(late_records) == 1, f"Expected 1 late record, got {len(late_records)}"

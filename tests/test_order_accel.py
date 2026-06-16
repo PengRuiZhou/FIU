@@ -242,19 +242,17 @@ def test_rust_accel_config_guard():
         assert use_rust_accel(config) is False
 
 
-def test_time_to_minute_key_integer_div():
-    """Verify str(time // 100_000) produces same result as str(time)[:12] for 17-digit timestamps."""
-    # This validates the optimization used in the Rust path
-    test_times = [
-        20260528090000123,
-        20260528113000123,
-        20260528150000123,
-        20260528080000000,
-    ]
-    for t in test_times:
-        str_method = str(t)[:12]
-        int_method = str(t // 100_000)
-        assert str_method == int_method, f"Mismatch for {t}: str[:12]={str_method}, //100_000={int_method}"
+def test_time_to_minute_key_round_up_parity():
+    """Python time_to_minute_key (floor+1) matches the expected round-up for trading-range times."""
+    from minute_bar.clock import time_to_minute_key
+    cases = {
+        20260528090000123: "202605280901",   # 09:00:00 → 0901
+        20260528090100123: "202605280902",   # 09:01:00 → 0902
+        20260528095900123: "202605281000",   # 09:59 → 1000 (cross-hour)
+        20260528153000123: "202605281531",   # 15:30 → 1531 (spillover)
+    }
+    for t, expected in cases.items():
+        assert time_to_minute_key(t) == expected, f"{t} → {time_to_minute_key(t)}, expected {expected}"
 
 
 # ── Phase 4: Engine-Level Integration Tests ──

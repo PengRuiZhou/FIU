@@ -93,13 +93,13 @@ class TestWriteLateOrdersBatchAppendPath:
             for r in recs:
                 by_minute.setdefault(time_to_minute_key(r.time), []).append(r)
 
-        # minute 0900 got exactly its 3 records, in original order
-        assert len(by_minute["202605280900"]) == 3
-        assert [r.time for r in by_minute["202605280900"]] == \
-            [20260528090000100, 20260528090000200, 20260528090000300]
-        # minute 0901 got exactly its 2 records
-        assert len(by_minute["202605280901"]) == 2
+        # minute 0901 got exactly its 3 records (was 0900 input → floor+1 → 0901)
+        assert len(by_minute["202605280901"]) == 3
         assert [r.time for r in by_minute["202605280901"]] == \
+            [20260528090000100, 20260528090000200, 20260528090000300]
+        # minute 0902 got exactly its 2 records (was 0901 input → floor+1 → 0902)
+        assert len(by_minute["202605280902"]) == 2
+        assert [r.time for r in by_minute["202605280902"]] == \
             [20260528090100100, 20260528090100200]
 
 
@@ -142,7 +142,7 @@ class TestWriteLateOrdersBatchInvariants:
              patch("minute_bar.engine.write_order_file"):
             engine._write_late_orders_batch(records, "/tmp/output", [])
 
-        assert engine._late_order_minutes == {"202605280900", "202605280901"}
+        assert engine._late_order_minutes == {"202605280901", "202605280902"}
 
     def test_tickfile_enabled_routes_every_record_as_late(self):
         engine = make_engine(enable_tickfile=True)
