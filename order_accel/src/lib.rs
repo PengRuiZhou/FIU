@@ -857,8 +857,8 @@ fn preprocess_line(
         return None;
     }
 
-    // minute_key: str(time)[:12] (12-char string slice)
-    let minute_key = &time_str[..12];
+    // minute_key: round-up (floor+1) via shared fn — keeps order/snapshot parity
+    let minute_key = time_to_minute_key(time_val);
 
     // Parse other fields
     let symbol = fields[0].to_string();
@@ -879,7 +879,7 @@ fn preprocess_line(
         decimal,
         rcvtime,
         date_key: date_key.to_string(),
-        minute_key: minute_key.to_string(),
+        minute_key,
         seqno: 0, // Assigned by caller after getting state
     })
 }
