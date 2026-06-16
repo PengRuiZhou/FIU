@@ -1,7 +1,7 @@
 # Tickfile Stale-Row 修复设计（shutdown 跳过 + replay 手术式补齐）
 
 > **Date**: 2026-06-16
-> **Status**: 设计已批准，待写实施计划
+> **Status**: ✅ 已实施（commits a6f3c03→29439ce，7 任务 subagent-driven，459 passed / 4 预存在失败）
 > **Parent / 前序**: `docs/superpowers/specs/2026-06-15-tickfile-shutdown-stale-persistence.md`（Q1 根因 + 验证）
 > **类型**: 行为变更（shutdown/cross-day 不再写 stale 行）+ replay 增强（手术式 gap 补齐）
 
