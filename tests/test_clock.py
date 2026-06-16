@@ -92,28 +92,36 @@ class TestIsDataDrivenExpired:
 
 
 class TestTimeToMinuteKeyRoundUp:
-    """Round-up: timestamp marks a minute-end snapshot → belongs to NEXT minute."""
+    """Left-open right-closed: bar M covers ((M-1):00.000, M:00.000].
+
+    Exact-minute-boundary timestamps (SSMMM=0) belong to their OWN minute;
+    sub-minute timestamps (>0) round up to the NEXT minute.
+    """
 
     def test_second_after_minute_start(self):
-        # 09:00:01.000 → 0901
+        # 09:00:01.000 (sub>0) → 0901
         assert time_to_minute_key(20260528090001000) == "202605280901"
 
     def test_just_before_minute_end(self):
-        # 09:00:59.000 → 0901 (still 0900 clock-minute, +1 → 0901)
+        # 09:00:59.000 (sub>0) → 0901
         assert time_to_minute_key(20260528090059000) == "202605280901"
 
-    def test_exact_minute_boundary_also_plus_one(self):
-        # 09:01:00.000 (exact on-minute) → 0902 (strict floor+1, no special-case)
-        assert time_to_minute_key(20260528090100000) == "202605280902"
+    def test_exact_minute_boundary_stays(self):
+        # 09:01:00.000 (exact boundary, SSMMM=0) → 0901 (own minute, NOT +1)
+        assert time_to_minute_key(20260528090100000) == "202605280901"
 
-    def test_cross_hour_carry(self):
-        # 09:59:01.000 → 1000 (mm=59+1=60 → hh+1, mm=0)
-        assert time_to_minute_key(20260528095901000) == "202605281000"
+    def test_close_timestamp_at_1530(self):
+        # 15:30:00.000 (the session close, exact boundary) → 1530 (NOT 1531)
+        assert time_to_minute_key(20260528153000000) == "202605281530"
 
-    def test_last_trading_minute_spillover_allowed(self):
-        # 15:30:01.000 → 1531 (allowed, not capped)
+    def test_sub_minute_after_close_rounds_up(self):
+        # 15:30:01.000 (sub>0, not the exact close) → 1531
         assert time_to_minute_key(20260528153001000) == "202605281531"
 
+    def test_cross_hour_carry(self):
+        # 09:59:01.000 (sub>0) → 1000 (mm=59+1=60 → hh+1, mm=0)
+        assert time_to_minute_key(20260528095901000) == "202605281000"
+
     def test_cross_day_carry_defensive(self):
-        # 23:59:01.000 → next-day 0000 (hh=24 → date+1, hh=0)
+        # 23:59:01.000 (sub>0) → next-day 0000 (hh=24 → date+1, hh=0)
         assert time_to_minute_key(20260528235901000) == "202605290000"

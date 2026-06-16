@@ -1272,13 +1272,19 @@ fn build_latest_snapshot_buf(
     buf
 }
 
-/// Round-UP: a timestamp marks a minute-end snapshot → it belongs to the NEXT clock minute.
-/// 09:00:01.000 → "0901" | 09:59:xx → "1000" | 23:59:xx → next-day "0000".
+/// Left-open right-closed: bar M covers ((M-1):00.000, M:00.000].
+///   - exact-minute-boundary T (SSMMM=0, e.g. 15:30:00.000) → its own minute ("1530")
+///   - sub-minute T (>0, e.g. 09:00:01.000) → next minute ("0901"); 09:59:xx → "1000";
+///     23:59:xx → next-day "0000".
 /// Python parity: clock.time_to_minute_key.
 fn time_to_minute_key(time: i64) -> String {
     let s = time.to_string();
     if s.len() < 12 {
         return s.chars().take(12).collect();
+    }
+    // Left-open right-closed: exact-minute-boundary timestamps stay in their own minute.
+    if s[12..].chars().all(|c| c == '0') {
+        return s[..12].to_string();
     }
     let date = &s[..8];
     let hh: u32 = s[8..10].parse().unwrap_or(0);
@@ -2813,7 +2819,7 @@ mod tests {
 
     #[test]
     fn test_ohlcv_time_to_minute_key() {
-        // Round-up: timestamp marks a minute-end snapshot → NEXT minute
+        // Left-open right-closed: sub-minute (>0) → next minute
         assert_eq!(time_to_minute_key(20260528090000123), "202605280901");
         assert_eq!(time_to_minute_key(20260528153000123), "202605281531");
         assert_eq!(time_to_minute_key(20260528000000123), "202605280001");
@@ -2821,6 +2827,10 @@ mod tests {
         assert_eq!(time_to_minute_key(20260528095959123), "202605281000");
         // Cross-day carry: 23:59:xx → next-day 0000
         assert_eq!(time_to_minute_key(20260528235959123), "202605290000");
+        // Exact-minute-boundary (SSMMM=0): stays in its own minute (NOT +1)
+        // — the session close 15:30:00.000 → 1530 (not 1531)
+        assert_eq!(time_to_minute_key(20260528153000000), "202605281530");
+        assert_eq!(time_to_minute_key(20260528090100000), "202605280901");
     }
 
     #[test]

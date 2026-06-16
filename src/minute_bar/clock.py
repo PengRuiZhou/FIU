@@ -48,14 +48,20 @@ def minute_key_to_end_time(minute_key: str) -> datetime:
 
 
 def time_to_minute_key(time_17digit: int) -> str:
-    """Round-UP: a timestamp marks a minute-end snapshot, so it belongs to the NEXT minute.
+    """Left-open right-closed: bar M covers ((M-1):00.000, M:00.000].
 
-    09:00:01.000 → '0901' | 09:59:xx → '1000' | 23:59:xx → next-day '0000'.
+    A timestamp belongs to bar M iff (M-1):00.000 < T <= M:00.000, so:
+      - exact-minute-boundary T (SSMMM=0, e.g. 15:30:00.000) → its own minute (1530)
+      - sub-minute T (>0, e.g. 09:00:01.000) → next minute (0901)
     See spec 2026-06-16-minute-key-round-up-design.
     """
     s = str(time_17digit)
     if len(s) < 12:
         return s[:12]  # malformed input — preserve prior best-effort behavior
+    # Left-open right-closed: exact-minute-boundary timestamps stay in their own minute.
+    sub = s[12:]  # SSMMM (5 digits for a 17-digit input)
+    if sub.strip('0') == '':  # exact boundary (or no sub-minute info)
+        return s[:12]
     base = datetime.strptime(s[:12], "%Y%m%d%H%M")
     return (base + timedelta(minutes=1)).strftime("%Y%m%d%H%M")
 
