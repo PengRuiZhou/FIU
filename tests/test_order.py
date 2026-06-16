@@ -110,10 +110,11 @@ class TestReplayWithOrder:
 
         snap_dir = tmp_path / "output" / "snapshot" / "2026" / "20260520"
         order_dir = tmp_path / "output" / "order" / "2026" / "20260520"
-        assert (snap_dir / "snapshot_minute_20260520_0930.csv").exists()
-        assert (order_dir / "order_minute_20260520_0930.csv").exists()
+        # Round-up: clock-minute 0930 timestamps → bucket 0931.
+        assert (snap_dir / "snapshot_minute_20260520_0931.csv").exists()
+        assert (order_dir / "order_minute_20260520_0931.csv").exists()
 
-        with open(order_dir / "order_minute_20260520_0930.csv", encoding="utf-8") as f:
+        with open(order_dir / "order_minute_20260520_0931.csv", encoding="utf-8") as f:
             reader = csv.reader(f)
             next(reader)
             rows = list(reader)
@@ -140,6 +141,7 @@ class TestReplayWithOrder:
 
         snap_dir = tmp_path / "output" / "snapshot" / "2026" / "20260520"
         order_dir = tmp_path / "output" / "order" / "2026" / "20260520"
-        assert (snap_dir / "snapshot_minute_20260520_0930.csv").exists()
+        # Round-up: clock-minute 0930 timestamp → bucket 0931.
+        assert (snap_dir / "snapshot_minute_20260520_0931.csv").exists()
         # No order file when no order.csv exists
-        assert not (order_dir / "order_minute_20260520_0930.csv").exists()
+        assert not (order_dir / "order_minute_20260520_0931.csv").exists()

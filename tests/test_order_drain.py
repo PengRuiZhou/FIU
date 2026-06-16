@@ -219,6 +219,8 @@ class TestDrainLoopRecordDrivenFlush:
 
         line_0930 = "1301,20260521093000123,4500.0,100.0,4510.0,200.0,2,20260521083000123"
         line_0931 = "1301,20260521093100123,4500.0,100.0,4510.0,200.0,2,20260521083000123"
+        # Round-up (floor+1): clock-minute 0930 record → bucket 0931,
+        # clock-minute 0931 record → bucket 0932 (triggers flush of 0931).
         read_lines_results = [
             iter([line_0930]),
             iter([line_0931]),
@@ -246,4 +248,6 @@ class TestDrainLoopRecordDrivenFlush:
 
         assert mock_flush_minute.call_count >= 1
         minute_keys = [c[0][1] for c in mock_flush_minute.call_args_list]
-        assert "202605210930" in minute_keys
+        # First record (clock-minute 0930) round-up maps to bucket 0931; when the
+        # second record's bucket (0932) arrives, 0931 is flushed.
+        assert "202605210931" in minute_keys

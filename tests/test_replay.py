@@ -60,27 +60,28 @@ class TestReplayEngine:
         output_dir = tmp_path / "output" / "snapshot" / "2026" / "20260520"
         assert output_dir.exists()
 
-        # Should have 2 snapshot files (0930, 0931)
-        snap_0930 = output_dir / "snapshot_minute_20260520_0930.csv"
+        # Should have 2 snapshot files. Round-up (floor+1): clock-minute 0930
+        # data → bucket 0931, clock-minute 0931 data → bucket 0932.
         snap_0931 = output_dir / "snapshot_minute_20260520_0931.csv"
-        assert snap_0930.exists()
+        snap_0932 = output_dir / "snapshot_minute_20260520_0932.csv"
         assert snap_0931.exists()
+        assert snap_0932.exists()
 
         # Verify snapshot content
-        with open(snap_0930, encoding="utf-8") as f:
+        with open(snap_0931, encoding="utf-8") as f:
             reader = csv.reader(f)
             header = next(reader)
             rows = list(reader)
             assert len(rows) == 3  # 1301 has 2 records + 1305 has 1 record
 
-        with open(snap_0931, encoding="utf-8") as f:
+        with open(snap_0932, encoding="utf-8") as f:
             reader = csv.reader(f)
             next(reader)
             rows = list(reader)
             assert len(rows) == 2
 
         # No kline files (enable_kline=False)
-        assert not (tmp_path / "output" / "kline" / "2026" / "20260520" / "kline_minute_20260520_0930.csv").exists()
+        assert not (tmp_path / "output" / "kline" / "2026" / "20260520" / "kline_minute_20260520_0931.csv").exists()
 
     def test_replay_empty_input(self, tmp_path):
         csv_dir = tmp_path / "input"
@@ -116,8 +117,9 @@ class TestReplayEngine:
 
         snap_dir = tmp_path / "output" / "snapshot" / "2026" / "20260520"
         kline_dir = tmp_path / "output" / "kline" / "2026" / "20260520"
-        assert (snap_dir / "snapshot_minute_20260520_0930.csv").exists()
-        assert (kline_dir / "kline_minute_20260520_0930.csv").exists()
+        # Round-up: snapshot timestamp 09:30:00.999 → bucket 0931.
+        assert (snap_dir / "snapshot_minute_20260520_0931.csv").exists()
+        assert (kline_dir / "kline_minute_20260520_0931.csv").exists()
 
 
 def write_order_csv(path, rows):
@@ -138,7 +140,8 @@ class TestReplayLateSnapshot:
             "1301,1,TSE,TestStock,JPY,equity,common,,,,0,0,0,2,0,,0",
         ])
 
-        # 09:30 records, then 09:31 triggers flush of 09:30, then late 09:30 record
+        # clock-minute 0930 records, then clock-minute 0931 (→ bucket 0932) triggers
+        # flush of bucket 0931, then a late clock-minute 0930 (→ bucket 0931) record.
         snapshot_rows = [
             "1301,20260520093000999,443500,450000,440000,451000,443500,450000,450000,100,100,45000000,1,,T,0,Y,2,0,0,20260520083000999",
             "1301,20260520093100999,443500,455000,440000,455000,443500,455000,455000,100,200,90000000,1,,T,0,Y,2,0,0,20260520083100999",
@@ -150,9 +153,10 @@ class TestReplayLateSnapshot:
         engine = ReplayEngine(config, date="20260520")
         engine.run()
 
-        snap_0930 = tmp_path / "output" / "snapshot" / "2026" / "20260520" / "snapshot_minute_20260520_0930.csv"
-        assert snap_0930.exists()
-        with open(snap_0930, encoding="utf-8") as f:
+        # Both clock-minute 0930 records round-up into bucket 0931.
+        snap_0931 = tmp_path / "output" / "snapshot" / "2026" / "20260520" / "snapshot_minute_20260520_0931.csv"
+        assert snap_0931.exists()
+        with open(snap_0931, encoding="utf-8") as f:
             reader = csv.reader(f)
             next(reader)
             rows = list(reader)
@@ -187,7 +191,7 @@ class TestReplayLateOrder:
         engine = ReplayEngine(config, date="20260520")
         engine.run()
 
-        order_path = tmp_path / "output" / "order" / "2026" / "20260520" / "order_minute_20260520_0930.csv"
+        order_path = tmp_path / "output" / "order" / "2026" / "20260520" / "order_minute_20260520_0931.csv"
         assert order_path.exists()
         with open(order_path, encoding="utf-8") as f:
             reader = csv.reader(f)

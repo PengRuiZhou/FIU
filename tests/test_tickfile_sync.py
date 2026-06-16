@@ -972,17 +972,18 @@ class TestLateOrderCapDropLoggingFinalBatch:
 
         engine._running = True
         engine._order_thread_error = None
-        # Minute "202605210900" is flushed, so records with that minute are "late"
-        engine._flushed_order_minutes = {"202605210900"}
+        # Round-up: a record at 09:00:00.123 derives minute_key 0901 (floor+1).
+        # Mark 0901 as flushed so these records are detected as "late".
+        engine._flushed_order_minutes = {"202605210901"}
         engine._late_order_count = 0
         engine._late_order_minutes = set()
 
         # Create 10 dummy line entries (bytes for parse_order_line compatibility)
-        # We'll patch parse_order_line to return ParsedOrder with time=20260521090000123
-        # so minute_key == "202605210900" which IS in _flushed_order_minutes → late detection.
+        # parse_order_line returns ParsedOrder with time=20260521090000123, which
+        # round-up maps to minute_key "202605210901" — IS in _flushed_order_minutes → late.
         lines = [b"1301,20260521090000123,4500,100,4510,200,2,20260521083000123" for _ in range(10)]
 
-        # Each parse returns a ParsedOrder with time that maps to minute "202605210900"
+        # Each parse returns a ParsedOrder whose time round-up maps to minute "202605210901"
         parsed = ParsedOrder(
             symbol="1301", time=20260521090000123,
             bidprice=4500, bidsize=100, askprice=4510, asksize=200,

@@ -101,7 +101,9 @@ class TestStep4LateRecords:
         flusher._step4_handle_late_records()
 
         assert state.late_snapshot_count == 1
-        assert "202605200930" in state.late_snapshot_minutes
+        # late_snapshot_minutes re-derives the minute from record.time via
+        # time_to_minute_key (round-up): 09:30:00.999 → bucket 0931.
+        assert "202605200931" in state.late_snapshot_minutes
 
     def test_late_records_queue_cleared_after_processing(self, tmp_path):
         state = SharedState()

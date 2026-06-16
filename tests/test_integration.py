@@ -49,8 +49,9 @@ class TestEndToEndPipeline:
         assert state.seqno == 3
         assert len(state.latest_snapshot) == 2
 
-        # Write output files
-        minute_key = "202605200930"
+        # Write output files. process_snapshot stored OHLCV under the round-up
+        # minute_key: clock-minute 0930 timestamps → bucket 0931.
+        minute_key = "202605200931"
         snapshot_copy = dict(state.latest_snapshot)
         ohlcv_data = state.ohlcv_buffers.get(minute_key, {})
 
@@ -59,7 +60,7 @@ class TestEndToEndPipeline:
         write_kline_file(output_dir, minute_key, snapshot_copy, ohlcv_data, code_table, full=True)
 
         # Verify snapshot file
-        snap_path = os.path.join(output_dir, "snapshot", "2026", "20260520", "snapshot_minute_20260520_0930.csv")
+        snap_path = os.path.join(output_dir, "snapshot", "2026", "20260520", "snapshot_minute_20260520_0931.csv")
         assert os.path.exists(snap_path)
         with open(snap_path) as f:
             reader = csv.reader(f)
@@ -68,7 +69,7 @@ class TestEndToEndPipeline:
             assert len(rows) == 2  # 2 symbols
 
         # Verify kline file
-        kline_path = os.path.join(output_dir, "kline", "2026", "20260520", "kline_minute_20260520_0930.csv")
+        kline_path = os.path.join(output_dir, "kline", "2026", "20260520", "kline_minute_20260520_0931.csv")
         assert os.path.exists(kline_path)
         with open(kline_path) as f:
             reader = csv.reader(f)
@@ -105,14 +106,15 @@ class TestEndToEndPipeline:
 
         output_dir = str(tmp_path / "output")
 
-        # Output minute 2 with carry-forward for 1305
-        minute_key = "202605200931"
+        # Output minute 2 with carry-forward for 1305. Round-up: clock-minute
+        # 0931 timestamp (093100999) → bucket 0932.
+        minute_key = "202605200932"
         ohlcv_data = state.ohlcv_buffers.get(minute_key, {})
         snapshot_copy = dict(state.latest_snapshot)
 
         write_kline_file(output_dir, minute_key, snapshot_copy, ohlcv_data, code_table, full=True)
 
-        kline_path = os.path.join(output_dir, "kline", "2026", "20260520", "kline_minute_20260520_0931.csv")
+        kline_path = os.path.join(output_dir, "kline", "2026", "20260520", "kline_minute_20260520_0932.csv")
         with open(kline_path) as f:
             reader = csv.reader(f)
             next(reader)
