@@ -299,19 +299,26 @@ class ReplayEngine:
             self._state.raw_snapshot_buffers.pop(minute_key, None)
 
         if self._enable_tickfile:
-            from minute_bar.writer import get_tickfile_path, recover_tickfile_seqno, write_tickfile_rows
-            from minute_bar.tickfile import select_tickfile_records
-            path = get_tickfile_path(output_dir, minute_key)
-            if self._tickfile_seqno == 0 and os.path.exists(path):
-                self._tickfile_seqno = recover_tickfile_seqno(output_dir, minute_key)
-            self._tickfile_seqno += 1
-            with self._state.lock:
-                order_records = self._state.raw_order_buffers.pop(minute_key, [])
-                latest_order_copy = dict(self._state.latest_order_by_symbol)
-            code_getter = (lambda symbol, t=self._code_table: t.table.get(symbol)) if self._code_table else None
-            selected = select_tickfile_records(raw_records, snapshot_copy, order_records, latest_order_copy)
-            write_tickfile_rows(output_dir, minute_key, selected, self._tickfile_seqno,
-                                code_table_getter=code_getter, skip_fsync=False)
+            # Part 2 (stale-fix): skip minutes already present in the output tickfile
+            # (fill only gaps; do not duplicate/corrupt correct rows). Check BEFORE seqno
+            # increment so skipped minutes do not burn seqno numbers.
+            if minute_key in self._generated_tickfile_minutes:
+                logger.debug("Replay skip already-generated tickfile minute=%s", minute_key)
+            else:
+                from minute_bar.writer import get_tickfile_path, recover_tickfile_seqno, write_tickfile_rows
+                from minute_bar.tickfile import select_tickfile_records
+                path = get_tickfile_path(output_dir, minute_key)
+                if self._tickfile_seqno == 0 and os.path.exists(path):
+                    self._tickfile_seqno = recover_tickfile_seqno(output_dir, minute_key)
+                self._tickfile_seqno += 1
+                with self._state.lock:
+                    order_records = self._state.raw_order_buffers.pop(minute_key, [])
+                    latest_order_copy = dict(self._state.latest_order_by_symbol)
+                code_getter = (lambda symbol, t=self._code_table: t.table.get(symbol)) if self._code_table else None
+                selected = select_tickfile_records(raw_records, snapshot_copy, order_records, latest_order_copy)
+                write_tickfile_rows(output_dir, minute_key, selected, self._tickfile_seqno,
+                                    code_table_getter=code_getter, skip_fsync=False)
+                self._generated_tickfile_minutes.add(minute_key)
 
         logger.info(
             "Output snapshot minute %s (%d updated, %d total)",

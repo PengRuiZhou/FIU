@@ -132,3 +132,57 @@ class TestReplayScanExtractor:
                            output=OutputConfig(output_dir=str(tmp_path), enable_tickfile=True))
         engine = ReplayEngine(config, date="20260528")
         assert engine._scan_generated_tickfile_minutes(str(tmp_path)) == set()
+
+
+class TestReplaySkipAlreadyGenerated:
+    """Part 2: replay skips minutes already in the tickfile (no duplicate/corruption).
+    The strongest assertion is the integration test (Task 5); this unit test exercises
+    the guarded path (_flush_snapshot_minute) for a minute pre-seeded in
+    _generated_tickfile_minutes and pins the guard invariant: a skipped minute writes
+    no tickfile row and burns no seqno number."""
+
+    def test_skip_does_not_write_or_advance_seqno(self, tmp_path):
+        """A minute in _generated_tickfile_minutes is skipped inside _flush_snapshot_minute:
+        write_tickfile_rows is never called and _tickfile_seqno is unchanged.
+        (Full no-duplicate/corruption assertion is the Task 5 integration test.)"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from minute_bar.replay import ReplayEngine
+        from minute_bar.config import AppConfig, InputConfig, OutputConfig
+
+        config = AppConfig(input=InputConfig(csv_dir=str(tmp_path)),
+                           output=OutputConfig(output_dir=str(tmp_path), enable_tickfile=True,
+                                               enable_kline=False))
+        engine = ReplayEngine(config, date="20260528")
+        # Minimal state the guarded method needs (lock + empty buffers). SharedState is
+        # already imported at module top of this test file.
+        engine._state = SharedState()
+        engine._generated_tickfile_minutes = {"202605280901"}  # 0901 already present
+        engine._tickfile_seqno = 5
+
+        skipped_mk = "202605280901"
+        seqno_before = engine._tickfile_seqno
+
+        # write_snapshot_file / write_kline_file are MODULE-LEVEL imports in replay.py,
+        # so patch them at the lookup site (minute_bar.replay.<name>) so the method's
+        # snapshot write completes without real buffers. write_tickfile_rows is
+        # LAZILY imported inside the method body (``from minute_bar.writer import ...``),
+        # so it must be patched at its SOURCE (minute_bar.writer.write_tickfile_rows);
+        # patching minute_bar.replay.write_tickfile_rows would NOT intercept the lookup.
+        with patch("minute_bar.replay.write_snapshot_file") as mock_snap, \
+             patch("minute_bar.replay.write_kline_file"), \
+             patch("minute_bar.writer.write_tickfile_rows") as mock_write:
+            engine._flush_snapshot_minute(
+                minute_key=skipped_mk,
+                output_dir=str(tmp_path),
+                code_table=engine._code_table,
+                full_snapshot=True,
+                full_kline=False,
+                enable_kline=False,
+                write_executor=ThreadPoolExecutor(max_workers=1),
+            )
+
+        assert mock_write.call_count == 0, "skipped minute must NOT write a tickfile row"
+        assert engine._tickfile_seqno == seqno_before, "skipped minute must NOT burn a seqno"
+        # And it must not have registered the minute as newly generated.
+        assert engine._generated_tickfile_minutes == {"202605280901"}
