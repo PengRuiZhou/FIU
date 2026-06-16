@@ -39,6 +39,45 @@ class ReplayEngine:
         )
         self._enable_tickfile = config.output.enable_tickfile
         self._tickfile_seqno: int = 0
+        # Part 2 (stale-fix): minutes already present in the output tickfile;
+        # populated by startup scan, used to skip already-generated minutes (fill only gaps).
+        self._generated_tickfile_minutes: set = set()
+
+    def _scan_generated_tickfile_minutes(self, output_dir: str) -> set:
+        """Scan the day's tickfile; return the set of minute_keys already present.
+
+        tickfile is ONE file per day (tickfile_{date}.csv); the UpdateTime column
+        (index 16) is minute_key-derived (tickfile.py), so each row's minute is
+        recoverable. Returns empty set if no tickfile exists (pure replay unaffected).
+        Spec 2026-06-16-tickfile-stale-fix-design §4.1.
+        """
+        from minute_bar.writer import get_tickfile_path
+        sample_mk = f"{self._date}0000"   # any minute of the date -> same per-day path
+        path = get_tickfile_path(output_dir, sample_mk)
+        if not os.path.exists(path):
+            return set()
+        return self._extract_minutes_from_tickfile(path)
+
+    @staticmethod
+    def _extract_minutes_from_tickfile(path: str) -> set:
+        """Read a per-day tickfile; return distinct minute_keys from the UpdateTime column."""
+        present: set = set()
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            for line_num, line in enumerate(f, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if line_num == 1:
+                    continue  # header row — fields[16] is the literal 'UpdateTime'
+                fields = stripped.split(",")
+                if len(fields) != 65:
+                    continue  # corrupted/truncated line — skip (mirror recover_tickfile_seqno)
+                update_time = fields[16]
+                # Format "YYYYMMDD HH:MM:00" -> 12-char minute_key "YYYYMMDDHHMM"
+                minute_key = update_time.replace(" ", "").replace(":", "")[:12]
+                if len(minute_key) == 12 and minute_key.isdigit():
+                    present.add(minute_key)
+        return present
 
     def run(self) -> None:
         logger.info("Replay mode: loading data for date %s", self._date)
@@ -55,6 +94,18 @@ class ReplayEngine:
         self._state = SharedState(
             first_seen_volume_base=self._config.aggregation.first_seen_volume_base
         )
+
+        # Part 2 (stale-fix): learn which minutes are already in the output tickfile so we
+        # skip them (fill only gaps). No-op when no tickfile exists (pure replay).
+        if self._enable_tickfile:
+            self._generated_tickfile_minutes = self._scan_generated_tickfile_minutes(
+                self._config.output.output_dir
+            )
+            if self._generated_tickfile_minutes:
+                logger.info(
+                    "Replay: %d tickfile minutes already present — will skip, fill only gaps",
+                    len(self._generated_tickfile_minutes),
+                )
 
         write_executor = ThreadPoolExecutor(max_workers=2)
 

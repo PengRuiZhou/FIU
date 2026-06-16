@@ -95,3 +95,40 @@ class TestCrossDaySkipsUnreachedMinutes:
         called = [c.args[0] for c in mock_gen.call_args_list]
         assert "202605280900" in called
         assert "202605281500" not in called
+
+
+class TestReplayScanExtractor:
+    """Part 2: UpdateTime column -> minute_key extraction (the scan primitive)."""
+
+    def test_extract_minutes_skips_header_and_reverses_updatetime(self, tmp_path):
+        from minute_bar.replay import ReplayEngine
+        from minute_bar.config import AppConfig, InputConfig, OutputConfig
+        from minute_bar.tickfile import TICKFILE_HEADER
+        from minute_bar.writer import get_tickfile_path
+        config = AppConfig(input=InputConfig(csv_dir=str(tmp_path)),
+                           output=OutputConfig(output_dir=str(tmp_path), enable_tickfile=True))
+        engine = ReplayEngine(config, date="20260528")
+        # Build a valid 65-field tickfile row: InstrumentID(0),TradingDay(1),..UpdateTime(16)..Seqno(59),LocalTime(60)
+        path = get_tickfile_path(str(tmp_path), "202605280900")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fields = [""] * 65
+        fields[0] = "7203"; fields[1] = "20260528"; fields[16] = "20260528 09:01:00"
+        fields[59] = "1"; fields[60] = "2026-05-28 09:01:00.000000"
+        row_0901 = ",".join(fields)
+        fields2 = list(fields)
+        fields2[16] = "20260528 09:02:00"; fields2[59] = "2"
+        row_0902 = ",".join(fields2)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(TICKFILE_HEADER + "\n" + row_0901 + "\n" + row_0902 + "\n")
+
+        present = engine._scan_generated_tickfile_minutes(str(tmp_path))
+
+        assert present == {"202605280901", "202605280902"}
+
+    def test_scan_returns_empty_when_no_tickfile(self, tmp_path):
+        from minute_bar.replay import ReplayEngine
+        from minute_bar.config import AppConfig, InputConfig, OutputConfig
+        config = AppConfig(input=InputConfig(csv_dir=str(tmp_path)),
+                           output=OutputConfig(output_dir=str(tmp_path), enable_tickfile=True))
+        engine = ReplayEngine(config, date="20260528")
+        assert engine._scan_generated_tickfile_minutes(str(tmp_path)) == set()
