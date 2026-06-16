@@ -186,3 +186,79 @@ class TestReplaySkipAlreadyGenerated:
         assert engine._tickfile_seqno == seqno_before, "skipped minute must NOT burn a seqno"
         # And it must not have registered the minute as newly generated.
         assert engine._generated_tickfile_minutes == {"202605280901"}
+
+
+class TestReplayGapFillIntegration:
+    """End-to-end: replay fills missing gap minutes without duplicating correct rows."""
+
+    def test_replay_fills_gap_without_corrupting_correct_rows(self, tmp_path):
+        import csv
+        from minute_bar.config import (AggregationConfig, AppConfig, InputConfig,
+                                       OutputConfig)
+        from minute_bar.replay import ReplayEngine
+        from minute_bar.tickfile import TICKFILE_HEADER
+        from minute_bar.writer import get_tickfile_path
+
+        date = "20260520"
+        out_dir = tmp_path / "output"
+        in_dir = tmp_path / "input"
+        in_dir.mkdir()
+        out_dir.mkdir()
+
+        # code.csv — exact 17-field format proven in tests/test_replay.py:41
+        (in_dir / f"code.csv.{date}").write_text(
+            "7203,1,TSE,Toyota,JPY,equity,common,,,,0,0,0,2,0,,0\n", encoding="utf-8")
+
+        # snapshot.csv — 21-field rows (proven format, tests/test_replay.py:48).
+        # Round-up (floor+1, sub-minute > 0): clock-min 0930 data -> bucket 0931;
+        # clock-min 0931 data -> bucket 0932.
+        snapshot_rows = [
+            # clock-minute 0930 -> tickfile bucket 202605200931 (the "correct" pre-seeded minute)
+            "7203,20260520093000999,443500,450000,440000,451000,443500,450000,450000,100,100,45000000,1,,T,0,Y,2,0,0,20260520083000999",
+            # clock-minute 0931 -> tickfile bucket 202605200932 (the gap to fill)
+            "7203,20260520093100999,443500,455000,440000,455000,443500,455000,455000,100,300,135000000,1,,T,0,Y,2,0,0,20260520083100999",
+        ]
+        with open(in_dir / f"snapshot.csv.{date}", "wb") as f:
+            for r in snapshot_rows:
+                f.write(r.encode("utf-8") + b"\n")
+
+        # Pre-seed the output tickfile with bucket 0931 ALREADY generated (correct row),
+        # simulating a live run that completed 0931 but not 0932.
+        seed_path = get_tickfile_path(str(out_dir), f"{date}0931")  # per-day file
+        os.makedirs(os.path.dirname(seed_path), exist_ok=True)
+        fields = [""] * 65
+        fields[0] = "7203"
+        fields[1] = date
+        fields[16] = f"{date} 09:31:00"   # UpdateTime -> minute_key 202605200931
+        fields[59] = "1"                   # Seqno
+        fields[60] = "2026-05-20 09:30:00.999000"  # LocalTime
+        with open(seed_path, "w", encoding="utf-8") as f:
+            f.write(TICKFILE_HEADER + "\n" + ",".join(fields) + "\n")
+        correct_rows_before = 1  # one pre-seeded data row for 0931
+
+        config = AppConfig(
+            input=InputConfig(csv_dir=str(in_dir), file_encoding="utf-8"),
+            output=OutputConfig(output_dir=str(out_dir), enable_order=False,
+                                enable_tickfile=True, enable_kline=False),
+            aggregation=AggregationConfig(first_seen_volume_base="start_totalvol"),
+        )
+        engine = ReplayEngine(config, date=date)
+        engine.run()
+
+        # Read the resulting tickfile; group rows by minute_key (UpdateTime col 16)
+        with open(seed_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            next(reader)  # header
+            by_minute = {}
+            for row in reader:
+                if len(row) != 65:
+                    continue
+                mk = row[16].replace(" ", "").replace(":", "")[:12]
+                by_minute.setdefault(mk, 0)
+                by_minute[mk] += 1
+
+        # 0931 (pre-seeded correct) must be UNCHANGED — NOT duplicated
+        assert by_minute.get(f"{date}0931", 0) == correct_rows_before, \
+            "correct 0931 row was duplicated/corrupted"
+        # 0932 (the gap) must now be filled
+        assert by_minute.get(f"{date}0932", 0) >= 1, "gap minute 0932 was not filled"
