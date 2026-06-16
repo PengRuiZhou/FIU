@@ -1024,3 +1024,29 @@ seqno=2  UpdateTime=20260528 08:30  LocalTime=08:00:00.040000  ✅ LocalTime 不
 - ✅ Phase 21 (Full Rust De-GIL) — 完成，46 tests
 - ✅ Phase 21 late-order 修复 — 完成，commit 69cbde7
 - ⏸ Q1 tickfile stale 残留 — 记录为后续改进，实时影响小
+
+---
+
+## Session 25 — 2026-06-16 (Minute-Key Round-Up：左开右闭语义变更)
+
+> 把 minute_key 从 round-down 改为**左开右闭 round-up**，order/snapshot 统一。
+> 起因：tickfile 质量检查发现时间戳是"分钟末快照"语义，`09:00:01.000` 应归 0901。
+> Spec `2026-06-16-minute-key-round-up-design.md`，Plan `2026-06-16-minute-key-round-up.md`。
+
+### 已完成（subagent-driven，9 任务 + 边界细化）
+- **Python**：`time_to_minute_key` → round-up；`end_time`→M、`start_time`→M−1min；4 个内联推导点改走函数
+- **Rust**：`time_to_minute_key` → round-up（手写进位，无 chrono）；order 路径改走函数
+- **测试**：所有 golden 字面量 +1（含 late-routing 协调平移）；重建 .pyd
+- **边界细化**（commit 76830d2）：初版严格 floor+1（整点也+1），发现收盘 `15:30:00.000` 被推到 spurious 1531 → 改**左开右闭**（精确边界归自身），收盘正确归 1530
+- **E2E**：full_day_run 验证 round-up 在实时管道生效（0900-clock 数据落 `_0901.csv`，4505 symbol 覆盖，无 stale）
+
+### 关键发现（6-agent 调查纠正 spec 漏洞）
+- spec 原假设"改 time_to_minute_key 就全覆盖"**错误**：实际 **5 个独立内联推导点**（Rust order 热路径 + 4 Python 点）必须同步改，否则边界记录分裂
+- 左开右闭只影响精确边界时间戳（全天 ~35K 条，基本都在收盘），盘中上亿 tick 不变；`end_time`/`start_time` 无需再改（已匹配 `(M−1,M]` 区间）
+
+### 验证
+- Python 451 passed / 4 预存在失败（与 round-up 无关）；Rust 75/0；bar-width 不变量保持
+- 收盘 `15:30:00.000` → 1530（.pyd 实测 + E2E）
+
+### 提交链
+实现 `d606692 → 79610c3`（8 commits）+ 边界细化 `76830d2`

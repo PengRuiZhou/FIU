@@ -873,6 +873,31 @@ Order thread peak-minute performance（0900: 747K records）takes 147s > 60s req
 
 ---
 
+## Phase 22: Minute-Key Round-Up（左开右闭）`[complete]`
+
+> minute_key 从 round-down 改为**左开右闭 round-up**，order/snapshot 统一。
+> Spec `2026-06-16-minute-key-round-up-design.md`，Plan `2026-06-16-minute-key-round-up.md`。
+
+### 实施完成（subagent-driven，9 任务 + 边界细化）
+- [x] Python `time_to_minute_key` → round-up；`end_time`→M、`start_time`→M−1min
+- [x] 4 个 Python 内联推导点改走函数（engine.py 859/962/1031/1050）
+- [x] Rust `time_to_minute_key` → round-up（手写进位，无 chrono）+ order 路径改走函数
+- [x] golden 测试字面量 +1（含 late-routing 协调平移）+ 重建 .pyd
+- [x] **边界细化**（commit 76830d2）：严格 floor+1 → **左开右闭**（收盘 15:30:00.000 归 1530）
+- [x] E2E 验证：round-up 在实时管道生效，收盘 → 1530，4505 symbol 覆盖，无 stale
+
+### 关键教训
+- spec"单点覆盖"假设错误：5 个独立内联推导点必须同步改（6-agent 调查发现）
+- 左开右闭只影响精确边界时间戳（~35K 条，基本在收盘）；end_time/start_time 无需再改
+
+### 验证
+- Python 451 passed / 4 预存在失败；Rust 75/0；bar-width 不变量保持；Python↔Rust 逐字节一致
+
+### 提交链
+`d606692 → 79610c3`（8 commits）+ 边界细化 `76830d2`
+
+---
+
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
