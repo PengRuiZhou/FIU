@@ -761,6 +761,9 @@ class TestFlushAllRemainingSkipTickfileParam:
         from minute_bar.code_table import CodeTable
 
         state = SharedState()
+        # Order watermark must reach the pending minute; otherwise the shutdown
+        # gate (tickfile-stale-fix §3.1) correctly skips it. 0900 == 0900 → reached.
+        state.order_current_minute = "202606020900"
         state._tickfile_pending["202606020900"] = {"raw_records": {}, "snapshot_copy": {}}
         flusher = ClockWatermarkFlusher(
             state=state, code_table=CodeTable("dummy"),

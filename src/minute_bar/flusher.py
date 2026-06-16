@@ -483,20 +483,34 @@ class ClockWatermarkFlusher:
         # After all threads are joined, no new late records will be added.
         self._step4_handle_late_records()
 
-        # Generate tickfile for remaining pending minutes (EOF fallback)
+        # Generate tickfile for remaining pending minutes (EOF fallback).
+        # Gate on order watermark: skip minutes order never reached (would be stale
+        # carry-forward). Spec 2026-06-16-tickfile-stale-fix-design §3.1.
         if not skip_tickfile and self._enable_tickfile:
             tickfile_errors = 0
+            skipped_keys: list = []
             with self._state.lock:
                 remaining_pending = sorted(self._state._tickfile_pending.keys())
+                order_wm = self._state.order_current_minute
             for mk in remaining_pending:
-                try:
-                    self._try_generate_tickfile(mk)
-                except Exception:
-                    tickfile_errors += 1
-                    logger.exception("EOF tickfile generation failed for minute=%s", mk)
+                if order_wm and order_wm >= mk:
+                    try:
+                        self._try_generate_tickfile(mk)
+                    except Exception:
+                        tickfile_errors += 1
+                        logger.exception("EOF tickfile generation failed for minute=%s", mk)
+                else:
+                    skipped_keys.append(mk)
+            if skipped_keys:
+                logger.warning(
+                    "Shutdown skipped %d tickfile minutes order hadn't reached "
+                    "(no stale rows written; fill via ReplayEngine --date=%s): %s",
+                    len(skipped_keys), jst_now_yyyymmdd(), skipped_keys[:20],
+                )
             if remaining_pending:
-                logger.info("EOF tickfile summary: %d generated, %d failed",
-                            len(remaining_pending) - tickfile_errors, tickfile_errors)
+                logger.info("EOF tickfile summary: %d generated, %d skipped, %d failed",
+                            len(remaining_pending) - len(skipped_keys) - tickfile_errors,
+                            len(skipped_keys), tickfile_errors)
         elif skip_tickfile and self._enable_tickfile:
             pending_count = len(self._state._tickfile_pending)
             queue_depth = 0
