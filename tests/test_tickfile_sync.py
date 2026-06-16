@@ -864,6 +864,10 @@ class TestCrossDayForceGenerationLogsFailures:
         state.first_data_received = True
         state.last_output_date = "20260601"
         state.current_minute = "202606021000"
+        # order reached this minute (valid watermark) so it enters the generate path
+        # where the mocked IO error leaves it pending and triggers the CRITICAL log.
+        # Without this, the stale-fix gate would skip it (deferred to replay).
+        state.order_current_minute = "202606010900"
 
         # Set up pending that will cause _try_generate_tickfile to fail
         # (IO error during force-generation → pending stays)

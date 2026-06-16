@@ -218,20 +218,38 @@ class ClockWatermarkFlusher:
         if self._engine_ref:
             self._engine_ref._tickfile_writer_pause()
 
-        # Step 2: Force-generate remaining pending tickfiles BEFORE clearing
+        # Step 2: Force-generate remaining pending tickfiles BEFORE clearing.
+        # Gate on order watermark: skip minutes order never reached (would be stale).
+        # Spec 2026-06-16-tickfile-stale-fix-design §3.2.
         remaining_pending = []
+        skipped_keys: list = []
         with self._state.lock:
             remaining_pending = sorted(self._state._tickfile_pending.keys())
+            order_wm = self._state.order_current_minute
         if remaining_pending:
-            logger.warning(
-                "Cross-day: generating %d pending tickfiles before cleanup (order lagging)",
-                len(remaining_pending),
-            )
-            for mk in remaining_pending:
-                try:
-                    self._try_generate_tickfile(mk)
-                except Exception:
-                    logger.exception("Cross-day tickfile generation failed for minute=%s", mk)
+            generate_keys = [mk for mk in remaining_pending if order_wm and order_wm >= mk]
+            skipped_keys = [mk for mk in remaining_pending if not (order_wm and order_wm >= mk)]
+            if generate_keys:
+                logger.warning(
+                    "Cross-day: generating %d pending tickfiles before cleanup (order lagging)",
+                    len(generate_keys),
+                )
+                for mk in generate_keys:
+                    try:
+                        self._try_generate_tickfile(mk)
+                    except Exception:
+                        logger.exception("Cross-day tickfile generation failed for minute=%s", mk)
+            if skipped_keys:
+                # Remove skipped from pending so the Fix-G check below does not log them
+                # as failures; they are intentionally deferred to replay as 'missing'.
+                with self._state.lock:
+                    for mk in skipped_keys:
+                        self._state._tickfile_pending.pop(mk, None)
+                logger.warning(
+                    "Cross-day: skipped %d tickfile minutes order hadn't reached "
+                    "(no stale rows; fill via ReplayEngine --date=%s): %s",
+                    len(skipped_keys), jst_now_yyyymmdd(), skipped_keys[:20],
+                )
 
         # Fix-G: Log any minutes that failed to generate
         with self._state.lock:

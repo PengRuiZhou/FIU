@@ -74,3 +74,24 @@ class TestShutdownSkipsUnreachedMinutes:
             flusher.flush_all_remaining(skip_tickfile=False)
 
         assert mock_gen.call_count == 0             # nothing reached -> skip all
+
+
+class TestCrossDaySkipsUnreachedMinutes:
+    """Part 1: cross-day force-gen also skips order-unreached minutes."""
+
+    def test_cross_day_skips_unreached(self, tmp_path):
+        state = _make_state()
+        state.last_output_date = "20260528"        # yesterday
+        state.current_minute = "202605290930"      # today (triggers cross-day)
+        state.order_current_minute = "202605280930"  # yesterday's last order minute
+        # 0900 reached (<= 0930); 1500 unreached (> 0930)
+        state._tickfile_pending["202605280900"] = {"raw_records": {}, "snapshot_copy": {}}
+        state._tickfile_pending["202605281500"] = {"raw_records": {}, "snapshot_copy": {}}
+        flusher = _make_flusher(state, tmp_path)
+
+        with patch.object(flusher, "_try_generate_tickfile") as mock_gen:
+            flusher._step1_cross_day_check()
+
+        called = [c.args[0] for c in mock_gen.call_args_list]
+        assert "202605280900" in called
+        assert "202605281500" not in called
