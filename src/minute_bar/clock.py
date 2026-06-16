@@ -39,11 +39,12 @@ def extract_hhmm_from_minute_key(minute_key: str) -> str:
 
 
 def minute_key_to_end_time(minute_key: str) -> datetime:
+    """Round-up: bar M covers [(M-1):00, M:00); the end/cutoff is M's own moment."""
     yyyymmdd = minute_key[:8]
     hhmm = minute_key[8:12]
     hh, mm = int(hhmm[:2]), int(hhmm[2:])
     date_part = datetime.strptime(yyyymmdd, "%Y%m%d").replace(tzinfo=JST)
-    return date_part.replace(hour=hh, minute=mm) + timedelta(minutes=1)
+    return date_part.replace(hour=hh, minute=mm)
 
 
 def time_to_minute_key(time_17digit: int) -> str:
@@ -76,10 +77,10 @@ STALL_WARN_SECONDS = 300
 
 
 def minute_key_to_start_time(minute_key: str) -> datetime:
-    """Convert minute_key "YYYYMMDDHHMM" to the start datetime of that minute."""
+    """Round-up: bar M covers [(M-1):00, M:00); the start is M-1 minute."""
     if len(minute_key) != 12 or not minute_key.isdigit():
         raise ValueError(f"Invalid minute_key format: '{minute_key}', expected 12-digit YYYYMMDDHHMM")
-    return datetime.strptime(minute_key, "%Y%m%d%H%M").replace(tzinfo=JST)
+    return datetime.strptime(minute_key, "%Y%m%d%H%M").replace(tzinfo=JST) - timedelta(minutes=1)
 
 
 def is_data_driven_expired(minute_key: str, data_watermark: str, delay_minutes: int) -> bool:

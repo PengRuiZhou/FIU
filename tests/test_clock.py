@@ -11,21 +11,26 @@ from minute_bar.clock import (
 
 
 class TestMinuteKeyToStartTime:
+    """Round-up: bar M covers [(M-1):00, M:00), so start_time(M) = M-1 minute."""
+
     def test_valid_key(self):
+        # bar 0900 starts at 08:59
         dt = minute_key_to_start_time("202605210900")
-        assert dt.hour == 9
-        assert dt.minute == 0
+        assert dt.hour == 8
+        assert dt.minute == 59
         assert dt.tzinfo == JST
 
     def test_midnight(self):
+        # bar 0000 starts at previous-day 23:59
         dt = minute_key_to_start_time("202605210000")
-        assert dt.hour == 0
-        assert dt.minute == 0
-
-    def test_end_of_day(self):
-        dt = minute_key_to_start_time("202605202359")
         assert dt.hour == 23
         assert dt.minute == 59
+
+    def test_end_of_day(self):
+        # bar 2359 starts at 23:58
+        dt = minute_key_to_start_time("202605202359")
+        assert dt.hour == 23
+        assert dt.minute == 58
 
     def test_invalid_length(self):
         with pytest.raises(ValueError, match="12-digit"):
@@ -44,7 +49,8 @@ class TestMinuteKeyToStartTime:
             minute_key_to_start_time("202605210961")
 
     def test_cross_day_boundary(self):
-        dt = minute_key_to_start_time("202605202359")
+        # bar 0000 starts at prev-day 23:59; +1min crosses into day 21 00:00
+        dt = minute_key_to_start_time("202605210000")
         next_min = dt + timedelta(minutes=1)
         assert next_min.day == 21
         assert next_min.hour == 0
