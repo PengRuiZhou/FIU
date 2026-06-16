@@ -856,7 +856,7 @@ class Engine:
         # Group by minute_key while preserving per-minute insertion order.
         late_by_minute: Dict[str, List[OrderRecord]] = {}
         for rec in decoded_late:
-            mk = str(rec.time)[:12]
+            mk = time_to_minute_key(rec.time)
             self._late_order_count += 1
             self._late_order_minutes.add(mk)
             late_by_minute.setdefault(mk, []).append(rec)
@@ -959,7 +959,7 @@ class Engine:
                                             current_date = first_date
 
                                     for rec in records:
-                                        minute_key_for_record = str(rec.time)[:12]
+                                        minute_key_for_record = time_to_minute_key(rec.time)
                                         buf = buffers.get(minute_key_for_record)
                                         if buf is None:
                                             buf = _OrderMinuteBuffer()
@@ -1027,8 +1027,8 @@ class Engine:
                                             askprice=fields[4], asksize=fields[5],
                                             decimal=fields[6], rcvtime=fields[7],
                                         )
-                                        # time_to_minute_key: integer division + str() for efficiency
-                                        minute_key = str(record.time // 100_000)
+                                        # minute_key via shared round-up derivation
+                                        minute_key = time_to_minute_key(record.time)
                                         # Feed to SHARED processing function — single source of truth
                                         seqno, total_late_dropped, current_date, current_minute = \
                                             self._process_parsed_record(
@@ -1047,7 +1047,7 @@ class Engine:
                                         if record_date != today:
                                             continue
                                         seqno += 1
-                                        minute_key = str(record.time // 100_000)
+                                        minute_key = time_to_minute_key(record.time)
                                         # Feed to SAME shared processing function
                                         seqno, total_late_dropped, current_date, current_minute = \
                                             self._process_parsed_record(
