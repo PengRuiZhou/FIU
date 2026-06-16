@@ -47,8 +47,16 @@ def minute_key_to_end_time(minute_key: str) -> datetime:
 
 
 def time_to_minute_key(time_17digit: int) -> str:
+    """Round-UP: a timestamp marks a minute-end snapshot, so it belongs to the NEXT minute.
+
+    09:00:01.000 → '0901' | 09:59:xx → '1000' | 23:59:xx → next-day '0000'.
+    See spec 2026-06-16-minute-key-round-up-design.
+    """
     s = str(time_17digit)
-    return s[:12]
+    if len(s) < 12:
+        return s[:12]  # malformed input — preserve prior best-effort behavior
+    base = datetime.strptime(s[:12], "%Y%m%d%H%M")
+    return (base + timedelta(minutes=1)).strftime("%Y%m%d%H%M")
 
 
 def is_trading_minute(minute_key: str, session: SessionConfig) -> bool:
