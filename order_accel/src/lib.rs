@@ -532,7 +532,7 @@ fn rust_reset_state() -> PyResult<()> {
 ///   2. Parse CSV line (8 fields)
 ///   3. Date check: str(time)[:8] == today_str (STRING SLICE, NOT integer division)
 ///   4. Assign seqno (only for date-matching valid records)
-///   5. minute_key: str(time)[:12] (12-char string slice)
+///   5. minute_key: round-up (floor+1) via time_to_minute_key fn
 ///   6. Group by minute_key (IndexMap, preserves file order)
 ///   7. Late order detection: if minute_key in flushed_minutes → late_order_buf
 ///   8. latest_order per symbol: max (time, rcvtime)
@@ -792,7 +792,7 @@ struct PreprocessedRecord {
     decimal: i64,
     rcvtime: i64,
     date_key: String,  // str(time)[:8]
-    minute_key: String, // str(time)[:12]
+    minute_key: String, // round-up (floor+1) via time_to_minute_key
     seqno: u64,
 }
 

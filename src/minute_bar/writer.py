@@ -143,7 +143,14 @@ SNAPSHOT_HEADER = ("seqno,symbol,name,time,preclose,lastprice,open,high,low,clos
 
 
 def _minute_end_threshold(minute_key: str) -> int:
-    """Return next minute start as 17-digit time integer for carry-forward filtering."""
+    """Return next minute start as 17-digit time integer for carry-forward filtering.
+
+    NOTE (round-up): bar M covers [(M-1):00, M:00); its true right boundary is M:00.
+    This returns M+1:00, which is 1 minute loose. That is harmless: the carry-forward
+    "N" branch only fires for symbols absent from ohlcv_data[M], whose records all have
+    time < (M-1):00 (well below either threshold). Kept loose to avoid a behavior change
+    in the round-up migration; could be tightened to M:00 in a follow-up.
+    """
     yyyymmdd = int(minute_key[:8])
     hh = int(minute_key[8:10])
     mm = int(minute_key[10:12])
