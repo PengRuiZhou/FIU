@@ -12,6 +12,7 @@ import math
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from minute_bar.clock import time_to_minute_key
 from minute_bar.models import OHLCVAggregate, SnapshotRecord
 
 
@@ -31,7 +32,7 @@ def _python_reference_aggregate(records, current_minute, base_vol_by_symbol, bas
     late_minute_keys = []
 
     for rec in records:
-        minute_key = str(rec.time)[:12]
+        minute_key = time_to_minute_key(rec.time)
 
         if minute_key in flushed_set:
             late_minute_keys.append(minute_key)

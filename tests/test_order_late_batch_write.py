@@ -10,6 +10,7 @@ thread on file I/O during the 0900 open peak (watermark stuck at 0907).
 """
 from unittest.mock import patch
 
+from minute_bar.clock import time_to_minute_key
 from minute_bar.config import AppConfig, InputConfig, OutputConfig
 from minute_bar.engine import Engine
 from minute_bar.models import OrderRecord
@@ -90,7 +91,7 @@ class TestWriteLateOrdersBatchAppendPath:
             path, recs = call.args
             minute_key = path  # path encodes minute; we map via records' minute instead
             for r in recs:
-                by_minute.setdefault(str(r.time)[:12], []).append(r)
+                by_minute.setdefault(time_to_minute_key(r.time), []).append(r)
 
         # minute 0900 got exactly its 3 records, in original order
         assert len(by_minute["202605280900"]) == 3

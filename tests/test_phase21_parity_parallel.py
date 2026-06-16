@@ -11,6 +11,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from minute_bar.clock import time_to_minute_key
+
 
 class TestPhase21Parity:
     """Dual-path parity test between Rust and Python order processing."""
@@ -60,7 +62,7 @@ class TestPhase21Parity:
             fields = line_str.split(",")
             sym = fields[0]
             time_val = int(fields[1])
-            minute_key = str(time_val)[:12]
+            minute_key = time_to_minute_key(time_val)
 
             rec = OrderRecord(
                 symbol=sym, seqno=0, time=time_val,

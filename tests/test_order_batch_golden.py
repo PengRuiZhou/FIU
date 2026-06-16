@@ -12,6 +12,7 @@ import os
 # Ensure src/ is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from minute_bar.clock import time_to_minute_key
 from minute_bar.models import OrderRecord
 
 
@@ -66,7 +67,7 @@ def _python_reference_per_minute(lines, encoding, today, today_int, flushed_minu
             skipped += 1
             continue
 
-        minute_key = str(time_val)[:12]
+        minute_key = time_to_minute_key(time_val)
 
         try:
             bidprice = int(fields[2].strip())
