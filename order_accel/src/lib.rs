@@ -1272,10 +1272,51 @@ fn build_latest_snapshot_buf(
     buf
 }
 
-/// Extract minute_key from a snapshot time (17-digit integer).
-/// Python: str(time)[:12]
+/// Round-UP: a timestamp marks a minute-end snapshot → it belongs to the NEXT clock minute.
+/// 09:00:01.000 → "0901" | 09:59:xx → "1000" | 23:59:xx → next-day "0000".
+/// Python parity: clock.time_to_minute_key.
 fn time_to_minute_key(time: i64) -> String {
-    time.to_string()[..12].to_string()
+    let s = time.to_string();
+    if s.len() < 12 {
+        return s.chars().take(12).collect();
+    }
+    let date = &s[..8];
+    let hh: u32 = s[8..10].parse().unwrap_or(0);
+    let mm: u32 = s[10..12].parse().unwrap_or(0);
+    let mut new_mm = mm + 1;
+    let mut new_hh = hh;
+    let mut new_date = date.to_string();
+    if new_mm >= 60 {
+        new_mm = 0;
+        new_hh += 1;
+    }
+    if new_hh >= 24 {
+        new_hh = 0;
+        new_date = increment_yyyymmdd(&new_date);
+    }
+    format!("{}{:02}{:02}", new_date, new_hh, new_mm)
+}
+
+/// Increment a YYYYMMDD string by one calendar day (hand-rolled; no chrono dep).
+fn increment_yyyymmdd(date: &str) -> String {
+    let y: u32 = date[0..4].parse().unwrap_or(0);
+    let m: u32 = date[4..6].parse().unwrap_or(1);
+    let d: u32 = date[6..8].parse().unwrap_or(1);
+    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let dim = [31u32, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut ny = y;
+    let mut nm = m;
+    let mut nd = d + 1;
+    let cap = dim.get((m as usize).saturating_sub(1)).copied().unwrap_or(31);
+    if nd > cap {
+        nd = 1;
+        nm += 1;
+        if nm > 12 {
+            nm = 1;
+            ny += 1;
+        }
+    }
+    format!("{:04}{:02}{:02}", ny, nm, nd)
 }
 
 // ── aggregate_snapshot_batch Implementation ─────────────────────────────────
@@ -2233,7 +2274,7 @@ mod tests {
         assert_eq!(r.decimal, 2);
         assert_eq!(r.rcvtime, 0);
         assert_eq!(r.date_key, "20260528");
-        assert_eq!(r.minute_key, "202605280900");
+        assert_eq!(r.minute_key, "202605280901");
     }
 
     #[test]
@@ -2300,13 +2341,11 @@ mod tests {
     }
 
     #[test]
-    fn test_minute_key_string_slice() {
-        // Verify minute_key uses string slice [:12], NOT integer division
-        // time = 20260528090000123 → str[:12] = "202605280900"
+    fn test_minute_key_round_up() {
+        // Round-up: 09:00:00.123 (clock-minute 0900) → NEXT minute 0901
         let line = b"7203,20260528090000123,4580000,100,4590000,200,2,0";
         let result = preprocess_line(line, "utf-8", "20260528").unwrap();
-        assert_eq!(result.minute_key, "202605280900");
-        // Make sure it doesn't use integer division (time // 100_000_000_000 = 20260 which is wrong)
+        assert_eq!(result.minute_key, "202605280901");
     }
 
     #[test]
@@ -2774,10 +2813,14 @@ mod tests {
 
     #[test]
     fn test_ohlcv_time_to_minute_key() {
-        // Test minute_key extraction from 17-digit timestamp
-        assert_eq!(time_to_minute_key(20260528090000123), "202605280900");
-        assert_eq!(time_to_minute_key(20260528153000123), "202605281530");
-        assert_eq!(time_to_minute_key(20260528000000123), "202605280000");
+        // Round-up: timestamp marks a minute-end snapshot → NEXT minute
+        assert_eq!(time_to_minute_key(20260528090000123), "202605280901");
+        assert_eq!(time_to_minute_key(20260528153000123), "202605281531");
+        assert_eq!(time_to_minute_key(20260528000000123), "202605280001");
+        // Cross-hour carry: 09:59:xx → 1000
+        assert_eq!(time_to_minute_key(20260528095959123), "202605281000");
+        // Cross-day carry: 23:59:xx → next-day 0000
+        assert_eq!(time_to_minute_key(20260528235959123), "202605290000");
     }
 
     #[test]
