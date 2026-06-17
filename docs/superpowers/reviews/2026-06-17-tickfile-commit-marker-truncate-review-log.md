@@ -304,3 +304,117 @@
 
 ### Review log 文件路径
 * `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
+
+---
+
+## Review Round 3（对抗性深度复审）
+
+### 审核时间
+* 2026-06-17 19:00:00
+
+### 本轮审核目标
+* 对 Round 1+2 修复后的 spec 做**深度/对抗性**复审，找前两轮遗漏的问题（侧重动态/运行时正确性、失败模式、并发、运维真实性）。
+
+### Agent 原始摘要（简短）
+
+**Agent 1（崩溃恢复正确性）**：spec 在 `Engine.start()` 单次启动路径闭环，但**遗漏 writer 线程生产运行中的异常 retry / health-check 自动重启 / cross-day resume 三条重生路径**——partial minute 不被 truncate，重生 append → 重复行（C-R3-1，阻断性）。备份文件名 timestamp 同秒碰撞（M-R3-2）；seqno 恢复应与 truncate 合并同函数返回（M-R3-3）；writer-retry 重生用旧 snapshot_copy carry-forward 漂移（M-R3-4）。
+
+**Agent 2（IO/锁/并发）**：`_get_write_lock` 是**进程内** threading.RLock，**不跨进程**——live+replay 同目录操作 recovery truncate 与 append 不互斥 → 腐败（C-R3-1，最大未声明假设）。recovery 插入点与 seqno 双入口（flusher.__init__ lazy + start）冲突（M-R3-1）；`_cleanup_tickfile_tmp_files` 的 os.replace 路径不经 write_tickfile_rows → .tmp 无 marker（M-R3-2）；atomic-create 跨进程 rename 覆盖（M-R3-3）；备份 IO 失败行为未定义（M-R3-4）。
+
+**Agent 3（测试/运维/失败模式）**：**recovery 自身失败模式未定义**（扫描中途异常可能 truncate 到错误偏移 → 数据丢失，C-R3-1 fail-atomic）；测试全是合成文件无 fault-injection（M-R3-1）；metric 不跨崩溃存活，监控无法真正告警（M-R3-2）；rollback playbook 忽略源数据保留窗口（M-R3-3）；committed_set 未 date 过滤（M-R3-4）。
+
+### 综合问题清单（去重）
+
+#### Critical
+
+**C-R3-1 — writer 线程 retry / health-check 重启 / resume 路径不执行 recovery → 重生 append 到 partial minute → 重复行**
+- 来源: Agent 1
+- 问题: 所有 INV-CM-ORDER-* 只约束 `Engine.start()` 初始启动。但 `_try_generate_tickfile` 在 rows 写后、marker/fsync 前**抛 IOError**（disk-full，生产高频）→ except 块 re-insert pending → writer loop retry → **append 到已含 partial rows 的文件** → 重复行。health-check 自动重启 writer（engine.py:1458）同样无 recovery。
+- 影响: 生产 disk-full/IOError 远比硬崩溃常见，每次产生重复行。**设计核心价值（mid-append 无重复）在 live 路径不成立**。
+- 决议: Accepted。spec 加 INV-CM-REGEN-GUARD + INV-CM-ORDER-RESTART。
+- 状态: Accepted
+
+**C-R3-2 — recovery 自身失败模式未定义（fail-atomic 缺失）→ 扫描中途异常可能 truncate 到错误偏移 → 数据丢失**
+- 来源: Agent 3
+- 问题: §3.2 定义扫描→truncate，但未定义扫描中 OOM/IO 错误/编码异常的行为。`os.truncate(path, new_size)` 若在部分计算的偏移上执行 → 切掉完整分钟 → 永久丢失。recovery 比不 recovery 更危险。
+- 影响: 数据丢失。
+- 决议: Accepted。spec 加 INV-CM-FAIL-ATOMIC（扫描异常绝不触发 truncate）。
+- 状态: Accepted
+
+**C-R3-3 — 跨进程并发：`_get_write_lock` 是进程内 RLock，recovery truncate 与他进程 append 不互斥**
+- 来源: Agent 2
+- 问题: writer.py:31-35 threading.RLock 仅同进程。live 进程 append + replay 进程 recovery truncate 同一 output_dir → 截掉 live 刚 commit 的合法分钟 → 丢数据 + 内存/磁盘不一致。
+- 影响: 多进程部署（HA/灰度/live+replay 补数）数据腐败。
+- 决议: Accepted。spec 显式声明 INV-CM-SINGLEPROC + replay 启动 guard（拒绝 live 运行中的当天 date）；OS 建议锁作为 future（Deferred）。
+- 状态: Accepted
+
+#### Major
+
+**M-R3-1 — recovery 插入点须早于所有 seqno 入口（flusher.__init__ lazy + start）**
+- 来源: Agent 2
+- 决议: Accepted。INV-CM-ORDER-2 改为"recovery 严格早于所有 seqno 读取入口"。
+
+**M-R3-2 — `_cleanup_tickfile_tmp_files` 的 os.replace 路径不经 write_tickfile_rows → .tmp 无 marker；顺序未定义**
+- 来源: Agent 2
+- 决议: Accepted。spec 加 INV-CM-CLEANUP-ORDER（cleanup 在 recovery 前；.tmp 合法性校验含"末行合法 marker"，否则删 .tmp 让重生）。
+
+**M-R3-3 — 备份 timestamp 同秒碰撞 + 备份 IO 失败行为未定义**
+- 来源: Agent 1（碰撞）+ Agent 2（IO 失败）
+- 决议: Accepted。timestamp 用 `time.time_ns()`（纳秒）；备份 IO 失败 → 不 truncate + ERROR + abort recovery（文件保留 partial，降级 row-based）。
+
+**M-R3-4 — seqno 恢复应与 truncate 在同一函数同一锁内返回（合并扫描），防时序窗口**
+- 来源: Agent 1
+- 决议: Accepted。`_recover_tickfile_to_last_commit` 返回 `(committed_set, last_seqno, had_markers)`，seqno 只来自 committed 行；`recover_tickfile_seqno` 改薄包装/废弃。
+
+**M-R3-5 — committed_set 收集 marker/row-only minute 未 date 过滤 → 跨日错位 marker 污染**
+- 来源: Agent 3
+- 决议: Accepted。INV-CM-DATE-FILTER（committed_set 只收 `minute.startswith(date)`；跨日 marker → WARNING）。
+
+**M-R3-6 — rollback playbook 忽略源数据保留窗口（源 CSV 滚动删除后无法 replay-to-fresh）**
+- 来源: Agent 3
+- 决议: Accepted。§6 playbook 加 Step 0（验证源数据存在；缺失则不删/不覆盖受污染文件，grep -v 清空行）。
+
+**M-R3-7 — 测试全合成文件无 fault-injection，mid-append 错误拦不住**
+- 来源: Agent 3
+- 决议: Accepted。§7 加 fault-injection 测试（monkeypatch write/fsync 中途抛异常；write_bytes 构造 page-boundary 截断 marker / no-trailing-newline）。
+
+**M-R3-8 — metric 不跨崩溃存活，监控无法真正告警；需持久 audit log**
+- 来源: Agent 3
+- 决议: Accepted。§3.2 加持久 audit log（`output_dir/tickfile/tickfile_recovery.log`，每行 JSON + timestamp），支持重启循环检测。
+
+**M-R3-9 — writer-retry 重生用旧 snapshot_copy，carry-forward 可能轻微过时**
+- 来源: Agent 1
+- 决议: Accepted（文档化）。§8 风险表加一行（既有行为，marker 放大；可接受）。
+
+**M-R3-10 — atomic-create 跨进程 rename 覆盖（既有 bug，marker 放大）**
+- 来源: Agent 2
+- 决议: Accepted（fold 入 INV-CM-SINGLEPROC 声明）。短期单进程可接受；.tmp 加 PID/uuid 为 future。
+
+#### Minor（Deferred 到 plan）
+- m-R3-tail: tail-read 4096 窗口边界 marker 误判（仅冗余 \n，recovery 兜底）。
+- m-R3-empty: 空分钟（rowcount=0）是否写 marker 语义。
+- m-R3-perf: recovery 1.5M 行扫描耗时量化 note。
+- m-R3-win: Windows append-mode fsync 语义 note。
+- m-R3-seqno-skip: 合并扫描时 seqno 跳 marker 的 INV-CM-SEQNO-SKIP 文档。
+
+### Round 3 修改决议表
+
+| ID | 严重程度 | 问题 | 决议 | 状态 |
+| -- | ------ | --- | ---- | ---- |
+| C-R3-1 | Critical | writer retry/health-check/restart 无 recovery → 重复 | INV-CM-REGEN-GUARD + ORDER-RESTART | Accepted |
+| C-R3-2 | Critical | recovery 自身失败非 fail-atomic → 丢数据 | INV-CM-FAIL-ATOMIC | Accepted |
+| C-R3-3 | Critical | 跨进程 RLock 不互斥 | INV-CM-SINGLEPROC + replay guard | Accepted |
+| M-R3-1 | Major | seqno 双入口 | INV-CM-ORDER-2 扩展 | Accepted |
+| M-R3-2 | Major | cleanup .tmp 无 marker + 顺序 | INV-CM-CLEANUP-ORDER | Accepted |
+| M-R3-3 | Major | 备份碰撞 + IO 失败 | time_ns + 失败 abort | Accepted |
+| M-R3-4 | Major | seqno 与 truncate 合并 | recovery 返回 last_seqno | Accepted |
+| M-R3-5 | Major | committed_set 未 date 过滤 | INV-CM-DATE-FILTER | Accepted |
+| M-R3-6 | Major | rollback 源数据窗口 | playbook Step 0 | Accepted |
+| M-R3-7 | Major | 测试无 fault-injection | §7 fault-injection 测试 | Accepted |
+| M-R3-8 | Major | metric 不跨崩溃 | 持久 audit log | Accepted |
+| M-R3-9 | Major | retry carry-forward 漂移 | §8 风险表 | Accepted |
+| M-R3-10 | Major | atomic-create 跨进程覆盖 | fold 入 SINGLEPROC | Accepted |
+| m-R3-* (5) | Minor | 澄清/边界/note | 推 plan | Deferred |
+
+### Round 3 结论
+**3. 需要修改后进行 Round 4 复审。**（3 Critical + 10 Major Accepted。前两轮聚焦静态/启动正确性，Round 3 揭示动态运行时正确性（writer retry）、recovery 自身失败安全、跨进程并发三大类生产风险，必须 spec 闭环。）

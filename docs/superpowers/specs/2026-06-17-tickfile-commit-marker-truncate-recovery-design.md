@@ -81,11 +81,12 @@ POSIX 唯一的原子文件操作是 `rename`（整个文件替换）；**没有
 - **truncate 点 = 字节偏移最大**的合法 marker（按文件位置，**不**按 minute_key 排序——防跨日错位误判）。
 - **truncate 偏移（C4）**：truncate 到该 marker 行**自身的换行符之后**——即**保留该 marker 行 + 其 `\n`**，文件以 `...#COMMIT,<minute>,<rowcount>\n` 结尾（INV-CM-LAST：truncate 后文件末行必为合法 marker）。这保证下次 append 不把已 commit 分钟当 gap 重生。
 - 若该最后 marker 之后还有字节（未提交的部分分钟）→ **truncate 丢弃**；若文件恰好在最后 marker 换行处结束 → 不 truncate。
-- **备份（C4）**：truncate 前，若 `new_size < old_size`，把被丢弃的 `[new_size, old_size)` 字节复制到同目录 `tickfile_{date}.csv.truncated.{timestamp}`（INV-CM-BACKUP，取证用，运维定期清理）。
+- **备份（C4 + M-R3-3）**：truncate 前，若 `new_size < old_size`，把被丢弃的 `[new_size, old_size)` 字节复制到同目录 `tickfile_{date}.csv.truncated.{time_ns()}.{pid}`（**纳秒+pid** 杜绝同秒/同进程内 retry 双 truncate 碰撞覆盖）。**备份 IO 失败（磁盘满/权限）→ 不 truncate、记 CRITICAL、abort recovery**（文件保留 partial，降级 row-based，committed_set 仅含 marker minutes，由后续 append+recovery 兜底）——绝不"备份失败仍 truncate"（会永久丢取证）。
 
-**committed_set 来源（M2/M4）**：
-- 返回 `(committed_set, had_markers)`。
-- `had_markers=True`：`committed_set` = **所有合法 marker 的 minute 集合**（set 去重，处理 dup）∪ **marker 之前所有 65-字段数据行对应的 minute**（覆盖"新代码首次 append 到老文件"的混存场景——老 row-only 分钟不丢、不被当 gap 重生）。
+**committed_set 来源（M2/M4/M-R3-4/M-R3-5）**：
+- 返回 `(committed_set, last_seqno, had_markers)`（**M-R3-4**：recovery 在 truncate 后的文件上**同一函数同一锁内**返回 `last_seqno`——只来自 committed 行，防 seqno/recovery 时序窗口；`recover_tickfile_seqno` 改薄包装或废弃）。
+- `had_markers=True`：`committed_set` = **所有合法 marker 的 minute 集合**（set 去重，处理 dup）∪ **marker 之前所有 65-字段数据行对应的 minute**（覆盖混存）。
+- **INV-CM-DATE-FILTER（M-R3-5）**：committed_set 收集时只收 `minute.startswith(date)` 的 marker/行；发现跨日 marker（minute 前缀 ≠ date）→ WARNING `cross_day_marker`，不纳入 set。
 - `had_markers=False`（老文件无 marker 且有数据）：`committed_set=None` → 调用方降级 row-based `_extract_minutes`（不 truncate）。
 - 无数据行无 marker（空文件/仅 header）：`had_markers=False`，`committed_set=set()`，不 truncate。
 
@@ -117,6 +118,36 @@ metric（接入 engine 现有 `_tickfile_*` 计数器家族）：`tickfile_recov
 - **INV-CM-SKIPSET-REPLAY**：replay 路径写入 ReplayEngine 自身的 `self._generated_tickfile_minutes`（replay.py 字段，**与 live 的 SharedState 字段是两个独立字段**）。两条路径各自必须设对应字段。
 - **INV-CM-LOCK**：recovery 的 truncate 持 `_get_write_lock(path)`；writer 线程也持同一 lock → 互斥安全（且因 INV-CM-ORDER-1 时序，实际无并发）。
 - **INV-CM-ORDER-RESUME**（cross-day resume）：`_tickfile_writer_resume()`（cross-day reset 后重建 writer 线程）**无需**调 recovery——因 cross-day 已 `_generated_tickfile_minutes.clear()` 且目标为**新 date 的 fresh 文件**（不存在/仅 header，无 partial）。若未来引入 same-day resume（同 date 文件续写），必须在该路径补 recovery + 时序同 INV-CM-ORDER-1。
+- **INV-CM-ORDER-2**（扩展，M-R3-1）：recovery 必须严格早于**所有** seqno 读取入口——含 `ClockWatermarkFlusher.__init__` 的 `recover_tickfile_seqno_lazy`（engine 构造时即取）+ `start()` 的 `_recover_tickfile_seqno`。推荐：移除 `__init__` 的 lazy seqno 调用或改为 recovery 之后延迟，让 recovery 成为唯一首步。
+
+### 3.4 运行时正确性 / 失败安全 / 并发（Round 3 增补）
+
+前两轮聚焦 `Engine.start()` 静态启动路径；Round 3 揭示**生产运行时**的三类风险，必须 spec 闭环：
+
+**C-R3-1 — writer 线程 retry / health-check 重启 / resume 路径须自愈（防重生重复）**
+- **场景**：`_try_generate_tickfile` 在 rows 写后、marker/fsync 前**抛 IOError**（disk-full，生产高频）→ except 块 re-insert pending → writer loop retry → **append 到已含 partial rows 的文件 → 重复行**。`_tickfile_writer_health_check`（engine.py:1458）自动重启 writer 同样无 recovery。
+- **INV-CM-REGEN-GUARD**：`_try_generate_tickfile` append 路径的 **precondition = 文件末尾为合法 marker**（首分钟除外）。append 前若检测到末尾非法（partial rows / 截断 marker）→ 先 truncate 到最后合法 marker（复用 `_recover_tickfile_to_last_commit` 或其轻量子集），再 append。使**每次 append 自愈**，不只启动。
+- **INV-CM-ORDER-RESTART**：`_tickfile_writer_health_check` 与 same-day `_tickfile_writer_resume` 重启 writer 线程前，必须先调 `_recover_tickfile_to_last_commit`（同 INV-CM-ORDER-1 语义）。
+- 测试：`test_writer_ioerror_retry_truncates_partial_no_duplicate`（mock write 中途抛 IOError + 已写 partial rows → re-insert → retry → 文件无重复 + 末行合法 marker）、`test_writer_health_check_calls_recovery_before_restart`。
+
+**C-R3-2 — recovery 自身必须 fail-atomic（防扫描中途异常误 truncate）**
+- **场景**：`_recover_tickfile_to_last_commit` 扫描 1.5M 行中途 OOM/IO 错误/编码异常。若在部分计算的偏移上 `os.truncate` → 切掉完整分钟 → 永久丢失。recovery 比不 recovery 更危险。
+- **INV-CM-FAIL-ATOMIC**：整个 recovery "全有或全无"——**扫描（只读）阶段**在 try 内计算 `(new_size, committed_set, last_seqno)`；**仅当扫描无异常返回合法元组**才在锁内 truncate。扫描异常 → 记 CRITICAL、**文件原样不动（不 truncate、不备份）**、降级 row-based presence、re-raise 让上游决策。绝不"半截 truncate"。
+- 测试：`test_recovery_scan_io_error_aborts_without_truncate`（monkeypatch 文件迭代中途抛 OSError → 断言文件字节与崩溃前完全一致、无 `.truncated` 备份）。
+
+**C-R3-3 — 跨进程并发：进程内 RLock 不互斥**
+- **场景**：`_get_write_lock`（writer.py:31-35）是**进程内** `threading.RLock`，**不跨进程**。live 进程 append + replay 进程 recovery truncate 同一 output_dir → 截掉 live 刚 commit 的合法分钟 → 丢数据 + 内存/磁盘不一致。HA/灰度/live+replay 补数均触发。
+- **INV-CM-SINGLEPROC**（部署假设，必须显式声明）：**tickfile 目录在任意时刻仅被一个引擎进程（live XOR replay）写入**。
+- **replay guard**：`ReplayEngine.run()` 启动时，若 `output_dir` 检测到 live 进程持有（pidfile/lockfile，或 target date == live 运行中的 date）→ **abort with error**，拒绝并发。replay 的典型用途是补**历史/已停止** date，本应如此。
+- **atomic-create 跨进程 rename 覆盖（M-R3-10，既有 bug）**：两进程同日首分钟 atomic-create 同名 `.tmp` → 覆盖丢数据。同样由 INV-CM-SINGLEPROC 声明覆盖；根治（`.tmp` 加 pid/uuid + replace 前 stat）为 future（Deferred）。
+- 测试：`test_replay_rejects_concurrent_live_date`（模拟 pidfile 占用 → replay abort）。**future**：若需多进程，用 OS 建议锁（`fcntl.flock`/`msvcrt.locking`）包 truncate+append 段——Deferred。
+
+**M-R3-2 — `_cleanup_tickfile_tmp_files` 顺序 + .tmp marker**
+- **INV-CM-CLEANUP-ORDER**：`_cleanup_tickfile_tmp_files`（engine.py:344）必须在 recovery **之前**执行（先回收 atomic-create 残留 .tmp，recovery 再统一 truncate）；其 `.tmp` 合法性校验扩展为"header 合法 **且** 末行合法 marker"才 `os.replace`，否则**删除该 .tmp**（让其重生）。因 atomic-create 的 .tmp 经 write_tickfile_rows 应含 marker；若不含说明是旧代码残留或异常 → 删。
+
+**M-R3-8 — 持久 audit log（metric 不跨崩溃存活）**
+- recovery 完成后追加一行 JSON 到 `output_dir/tickfile/tickfile_recovery.log`（timestamp + date + had_markers + committed_count + last_commit_minute + truncate_bytes + result: truncate/noop/fallback/error）。**跨崩溃存活**，支持"重启循环检测"（同文件多次 recovery → 告警）。进程内 metric 仍保留（运行时观测），audit log 补跨进程持久性。
+- 测试：`test_recovery_writes_persistent_audit_log`（crash→restart→crash→restart → audit log 有 2 条按 timestamp 排序记录）。
 
 ## 4. 崩溃场景全覆盖（C7 修订：不依赖 rows/marker 精确区分）
 
@@ -166,8 +197,9 @@ def _is_legal_last_line(line):
 - 影响：文件累积空行。**内部 reader（`recover_tickfile_seqno` / `_extract_minutes`）按 `len!=65` 跳过空行不崩**；但外部严格 CSV consumer 可能解析失败。
 - 风险定性：**非破坏性数据损坏**（空行可被跳过/清理），但需告知。
 - **Rollback playbook**（写入部署文档）：
+  0. **（清理前必做，M-R3-6）验证源数据存在**：`input_dir/snapshot.csv.{date}` + `code.csv.{date}` 仍在保留窗口内。**若缺失 → 不要删/覆盖受污染 tickfile**（空行可被跳过、数据保留），改用 `grep -v '^$'` 清空行即可。replay-to-fresh 依赖源数据，源被滚动删除则无法重生。
   1. 回滚前统计：`grep -c '^#COMMIT' tickfile_*.csv` 确认哪些文件有 marker。
-  2. 回滚后若需清理空行：一次性 `replay-to-fresh-dir` 重生当天 tickfile（或 `sed` 删空行）。
+  2. 回滚后若需清理空行且源数据在：`replay-to-fresh-dir` 重生当天 tickfile（或 `sed` 删空行）。
   3. 优先策略：回滚窗口期内暂停 live tickfile 写入，用 replay 重生。
 
 ## 7. 测试计划（TDD，C6 补强）
@@ -210,7 +242,26 @@ def _is_legal_last_line(line):
 **外部 consumer 兼容（C5）**：
 - `test_external_csv_reader_skips_hash_lines`：标准 csv.reader 解析含 `#COMMIT` 行的 tickfile，断言跳过/显式处理。
 
-回归：现有 tickfile/replay/seqno-recovery 测试更新期望（marker 行存在；tail-check 谓词变化）。
+**Fault-injection / 真实崩溃字节（M-R3-7，拦 mid-append 错误）**：
+- `test_write_tickfile_rows_mid_append_exception_no_partial_marker`：monkeypatch `os.fsync` 在 N 次 write 后抛 OSError → 断言无 `#COMMIT` 行存活（证 INV-CM-BATCH）。
+- `test_recovery_scan_io_error_aborts_without_truncate`（C-R3-2）：文件迭代中途抛 OSError → 文件字节完全不变、无 `.truncated` 备份（INV-CM-FAIL-ATOMIC）。
+- `test_recover_handles_byte_truncated_marker_at_page_boundary`：`path.write_bytes(b"...#COMMIT,202605")`（无 `\n`、page 边界截断）→ 非法 marker，正确处理。
+- `test_recover_handles_no_trailing_newline_on_partial_rows`：partial rows 无尾 `\n` → 不误判。
+
+**Writer retry / health-check / 跨进程（Round 3）**：
+- `test_writer_ioerror_retry_truncates_partial_no_duplicate`（C-R3-1）：write 中途 IOError + partial rows → re-insert → retry → 无重复 + 末行合法 marker。
+- `test_writer_health_check_calls_recovery_before_restart`（C-R3-1）：writer 死亡 → health_check → recovery 被调 + skip-set 同步。
+- `test_replay_rejects_concurrent_live_date`（C-R3-3）：pidfile 占用 → replay abort。
+- `test_recovery_returns_seqno_from_committed_only`（M-R3-4）：partial 行 seqno 不进返回值。
+- `test_recover_filters_out_wrong_date_markers`（M-R3-5）：跨日 marker → WARNING，不进 committed_set。
+- `test_recovery_backup_no_collision_rapid_double`（M-R3-3）：同秒双 truncate → 两份备份（time_ns+pid）。
+- `test_cleanup_tmp_requires_marker_before_replace`（M-R3-2）：.tmp 无 marker → 删，不 replace。
+- `test_recovery_writes_persistent_audit_log`（M-R3-8）：双崩溃重启 → audit log 2 条。
+
+**Live restart E2E（M-R2-2 收紧，无半闭环 escape）**：
+- `test_e2e_live_restart_recovers_partial_minute`：**强制**（不退化半闭环）——复用 stale-fix `test_replay_fills_gap_without_corrupting_correct_rows` 的 snapshot+code CSV mock 模式喂 0902 数据，断言最终 0902 行数正确、无重复、末行合法 marker。
+
+回归：现有 tickfile/replay/seqno-recovery 测试更新期望（marker 行存在；tail-check 谓词变化；recovery 返回 3-tuple）。
 
 ## 8. 风险
 
@@ -224,6 +275,12 @@ def _is_legal_last_line(line):
 | **回滚：旧代码读新 marker 文件插空行（C5）** | 中 | 中 | §6 rollback playbook；内部 reader 跳空行不崩；外部 consumer 需知；replay-to-fresh 清理 |
 | 混存文件老分钟被当 gap 重生（M2） | 中 | 高 | §3.2 committed_set 纳入 marker 前 row-only 分钟 + WARNING；单测 |
 | rows+marker 拆两次 fsync → 重生重复（M1） | 中 | 高 | INV-CM-BATCH 不变量 + fsync 计数单测 |
+| **writer retry/health-check 重生不 truncate → 重复（C-R3-1）** | 高 | 高 | INV-CM-REGEN-GUARD（每次 append 自愈）+ ORDER-RESTART；disk-full/IOError 高频 |
+| **recovery 自身扫描异常误 truncate → 丢数据（C-R3-2）** | 低 | 高 | INV-CM-FAIL-ATOMIC（扫描异常不 truncate） |
+| **跨进程 live+replay 同目录 → 腐败（C-R3-3）** | 中 | 高 | INV-CM-SINGLEPROC 部署假设 + replay guard；多进程需 OS 锁（future） |
+| atomic-create 跨进程 rename 覆盖（M-R3-10，既有） | 低 | 高 | INV-CM-SINGLEPROC 覆盖；根治 .tmp+pid（future） |
+| writer-retry carry-forward 用旧 snapshot 略过时（M-R3-9） | 中 | 低 | §8 文档化（既有行为，marker 放大；可接受） |
+| rollback 源数据已删 → 无法 replay-to-fresh（M-R3-6） | 中 | 中 | §6 playbook Step 0 验证源存在 |
 
 ## 9. 范围外
 
