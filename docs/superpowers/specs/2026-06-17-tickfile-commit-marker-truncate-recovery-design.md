@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ Review 通过（Round 1: 7C+6M；Round 2: 1C+4M；Round 3: 3C+10M；Round 4: 2M 全修复），可进入 planning
+> **Status**: ✅ Review 通过（R1: 7C+6M；R2: 1C+4M；R3: 3C+10M；R4: 2M；R5: 7M 全修复），可进入 planning
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -112,8 +112,9 @@ metric（接入 engine 现有 `_tickfile_*` 计数器家族）：`tickfile_recov
 **Engine live 启动**（崩溃重启）：调同一函数 → truncate 上次崩溃留下的部分分钟 → live 从 checkpoint 恢复重处理该分钟（live feed 仍有数据则重生成 + 打 marker；无数据则缺失，由 replay 补——与 gap 一致）。
 
 **调用时序不变量（C2，生产正确性）**——必须在 spec 闭环，不能推到 plan：
-- **INV-CM-ORDER-1**：`_recover_tickfile_to_last_commit` 必须在 **`Engine.start()` spawn `_tickfile_writer_thread` 之前**调用（单线程，无并发）。插入点：engine.py `start()` 的 `enable_tickfile` 分支内、`self._tickfile_seqno = self._flusher._recover_tickfile_seqno()` 紧邻处，严格早于 `self._tickfile_writer_thread = Thread(...)`。否则 writer 线程已消费首个 minute 后再 truncate → 删掉刚写的合法行 → 丢数据。
-- **INV-CM-ORDER-2**：recovery（含 truncate）必须在 `recover_tickfile_seqno` **之前**完成（或 recovery 内部一次扫描同时返回 last_seqno）。否则 seqno 取到被 truncate 的分钟 → 倒退/跳号。
+- **INV-CM-ORDER-1**（M-R5-1 修正插入点）：`_recover_tickfile_to_last_commit` 必须在 **`ClockWatermarkFlusher.__init__` 的 seqno 获取点（flusher.py:98 `recover_tickfile_seqno_lazy`）执行**——而非 `start()`。因 `__init__` 在 `Engine.__init__`（构造期）就**急切**取 seqno，早于 `start()`；若 recovery 放 start()，`__init__` 已从 partial 文件取到脏 seqno。**推荐**：用 `_recover_tickfile_to_last_commit`（返回 3-tuple 含 last_seqno）**替换** flusher.py:98 的 `recover_tickfile_seqno_lazy`，使 recovery 成为 seqno 唯一首步（同调用点，无时序窗口）。recovery 仍须早于 `_tickfile_writer_thread.start()`（start() 内）。
+- **INV-CM-ORDER-2**：recovery（含 truncate）必须在所有 seqno 读取入口之前完成（由 INV-CM-ORDER-1 在 `__init__` 替换覆盖 + recovery 返回 last_seqno 消除 lazy 入口）。否则 seqno 取到被 truncate 分钟 → 倒退/跳号。
+- **INV-CM-SEQNO-MONO-FILE**（M-R5-2）：recovery 的 `last_seqno` 覆盖 `_tickfile_seqno` 时**取 `max(file_last_seqno, 当前内存 seqno)`，绝不倒退**。原因：REGEN-GUARD 分支 2 skip 消费 seqno 但无行落盘 → 文件 last_seqno 可能 < 内存已消费值；直接覆盖会倒退 → 下次写重用 seqno（不同内容同 seqno → 下游去重误判）。取 max 保单调。
 - **INV-CM-SKIPSET-LIVE**：recovery 返回的 `committed_set` 必须写入 live 引擎的 `self._state._generated_tickfile_minutes`（`aggregator.SharedState` 字段，flusher 读写同一 set）。否则 live writer 会重生已 commit 分钟 → 重复行。
 - **INV-CM-SKIPSET-REPLAY**：replay 路径写入 ReplayEngine 自身的 `self._generated_tickfile_minutes`（replay.py 字段，**与 live 的 SharedState 字段是两个独立字段**）。两条路径各自必须设对应字段。
 - **INV-CM-LOCK**：recovery 的 truncate 持 `_get_write_lock(path)`；writer 线程也持同一 lock → 互斥安全（且因 INV-CM-ORDER-1 时序，实际无并发）。
@@ -142,16 +143,33 @@ metric（接入 engine 现有 `_tickfile_*` 计数器家族）：`tickfile_recov
 **C-R3-3 — 跨进程并发：进程内 RLock 不互斥**
 - **场景**：`_get_write_lock`（writer.py:31-35）是**进程内** `threading.RLock`，**不跨进程**。live 进程 append + replay 进程 recovery truncate 同一 output_dir → 截掉 live 刚 commit 的合法分钟 → 丢数据 + 内存/磁盘不一致。HA/灰度/live+replay 补数均触发。
 - **INV-CM-SINGLEPROC**（部署假设，必须显式声明）：**tickfile 目录在任意时刻仅被一个引擎进程（live XOR replay）写入**。
-- **replay guard**：`ReplayEngine.run()` 启动时，若 `output_dir` 检测到 live 进程持有（pidfile/lockfile，或 target date == live 运行中的 date）→ **abort with error**，拒绝并发。replay 的典型用途是补**历史/已停止** date，本应如此。
+- **replay guard**（M-R5-4 强化）：`ReplayEngine.run()` 启动时用 **原子创建作锁**防 TOCTOU + stale 死锁：`os.open(pidfile, O_CREAT|O_EXCL|O_WRONLY)`（EXCL 内核原子，无 check-then-write 窗口），写 `{pid},{start_time_ns}`。若文件已存在：查 pid liveness（POSIX `os.kill(pid,0)` / win32 `ctypes.OpenProcess+GetExitCodeProcess`）——pid 死 → stale pidfile → reclaim（EXCL 重用，记 WARNING `stale_pidfile_reclaimed`）；pid 活 → live 真在运行 → **abort with error**。
 - **atomic-create 跨进程 rename 覆盖（M-R3-10，既有 bug）**：两进程同日首分钟 atomic-create 同名 `.tmp` → 覆盖丢数据。同样由 INV-CM-SINGLEPROC 声明覆盖；根治（`.tmp` 加 pid/uuid + replace 前 stat）为 future（Deferred）。
-- 测试：`test_replay_rejects_concurrent_live_date`（模拟 pidfile 占用 → replay abort）。**future**：若需多进程，用 OS 建议锁（`fcntl.flock`/`msvcrt.locking`）包 truncate+append 段——Deferred。
+- 测试：`test_replay_guard_atomic_excl_rejects_concurrent_start`（两线程并发 EXCL open，只一成功）、`test_replay_guard_reclaims_stale_pidfile_after_live_crash`（stale pidfile + pid 死 → replay 成功 + WARNING）、`test_replay_guard_aborts_when_live_pid_alive`。**future**：若需多进程，用 OS 建议锁（`fcntl.flock`/`msvcrt.locking`）包 truncate+append 段——Deferred。
 
 **M-R3-2 — `_cleanup_tickfile_tmp_files` 顺序 + .tmp marker**
 - **INV-CM-CLEANUP-ORDER**：`_cleanup_tickfile_tmp_files`（engine.py:344）必须在 recovery **之前**执行（先回收 atomic-create 残留 .tmp，recovery 再统一 truncate）；其 `.tmp` 合法性校验扩展为"header 合法 **且** 末行合法 marker"才 `os.replace`，否则**删除该 .tmp**（让其重生）。因 atomic-create 的 .tmp 经 write_tickfile_rows 应含 marker；若不含说明是旧代码残留或异常 → 删。
 
 **M-R3-8 — 持久 audit log（metric 不跨崩溃存活）**
-- recovery 完成后追加一行 JSON 到 `output_dir/tickfile/tickfile_recovery.log`（timestamp + date + had_markers + committed_count + last_commit_minute + truncate_bytes + result: truncate/noop/fallback/error）。**跨崩溃存活**，支持"重启循环检测"（同文件多次 recovery → 告警）。进程内 metric 仍保留（运行时观测），audit log 补跨进程持久性。
-- 测试：`test_recovery_writes_persistent_audit_log`（crash→restart→crash→restart → audit log 有 2 条按 timestamp 排序记录）。
+- recovery 完成后追加一行 JSON 到 `output_dir/tickfile/tickfile_recovery.log`。schema：`{ts, date, pid, hostname, had_markers, committed_count, last_commit_minute, truncate_bytes, result: truncate/noop/fallback/error}`（**M-R5-6**：加 pid/hostname 便多机取证）。**跨崩溃存活**，支持"重启循环检测"。
+- **INV-CM-AUDIT-BESTEFFORT**（M-R5-6）：audit log 写**必须** try/except 包裹、best-effort、**绝不 raise / 不阻断 recovery**（磁盘满正是触发 recovery 的场景，audit 可丢，recovery 本身有进程内 metric + logger 兜底）。写前 `os.makedirs(dirname, exist_ok=True)`。单行 JSON < 4KB，`open("a")`（设 O_APPEND）单次 write 原子（POSIX PIPE_BUF 4KB 内 / win32 共享默认）。
+- 测试：`test_recovery_writes_persistent_audit_log`、`test_recovery_audit_log_failure_does_not_abort`（monkeypatch audit open 抛 OSError → recovery 仍完成 truncate + metric 记录）。
+
+### 3.5 Round 5 增补：新逻辑与现有 state 的接缝
+
+**M-R5-3 — 分支 2 skip 职责切分（跨模块）**
+- **INV-CM-SKIP-DELEGATION**：REGEN-GUARD 分支 2 的 "skip" 与 "add committed" 分离——`write_tickfile_rows`（writer.py 模块函数，持文件锁，**无 SharedState 访问权**）内分支 2 仅做 **file-level skip**（零字节 return，不写文件）；"add committed" 由 `_try_generate_tickfile` 成功路径（flusher.py:660-661）**统一**承担（分支 2 skip 也走此路径，与真实 append 共用同一 add 点，不重复、不跨锁）。
+- 测试：`test_regen_guard_branch2_skip_delegates_add_to_flusher`（分支 2 零字节 return → flusher 仍 add committed + 文件无新行 + pending/order_buffers 已 pop）。
+
+**M-R5-5 — Windows：REGEN-GUARD 分支 1 / recovery truncate 与 append fd 顺序**
+- **INV-CM-TRUNCATE-BEFORE-OPEN**（win32 平台正确性）：truncate **必须**用 `os.truncate(path, new_size)`（path-based，独立短暂 fd）在 `_get_write_lock(path)` 内、**`with open(path,"a")` context 开始之前**执行。**禁止**用 append fd 的 `f.truncate()`（win32 上 append-fd truncate 后 fd 位置仍在旧 EOF → 下次 write 在新 EOF 与旧位置间留**稀疏空洞/零字节**）。POSIX append 模式每次 write seek 到 EOF，但 Python 文本模式 `"a"` open 时不保证定位 → truncate-before-open 是可移植安全模式。
+- recovery（§3.2）的 truncate 同样 path-based（`os.truncate(path)`），不重用 reader fd。
+- 若 `os.truncate` 在 win32 抛 sharing violation → 视为扫描异常 → INV-CM-FAIL-ATOMIC → 不 truncate。
+- 测试：`test_regen_guard_truncate_before_append_fd_open_no_sparse_gap`（truncate 与 open fd 间插桩，断言无零字节间隙）、`test_recovery_truncate_sharing_violation_aborts_clean`（monkeypatch os.truncate 抛 PermissionError → 文件不变、无备份、re-raise）。
+
+**M-R5-7 — writer restart 频率上限 + 永久死亡 metric + E2E feed seam**
+- **restart 上限文档**：`_tickfile_writer_restart_count` 硬上限 = 1（engine.py:1464 现状）→ 每进程最多 2 次 recovery 全扫（启动 1 + health-check 1）后 writer **永久死亡**（CRITICAL 日志）+ 进程级监控告警。加 metric `tickfile_writer_perm_dead`（0/1）。health-check 路径的 recovery 用 REGEN-GUARD per-append precondition（只扫末尾 4096，不扫全文件）——因 REGEN-GUARD 已保证每次 append 自愈，health-check restart 无需全量 recovery（避免 tick 循环阻塞）。
+- **E2E feed seam**（M-R5-7/A3）：`test_e2e_live_restart_recovers_partial_minute` 用**种子 csv_dir**（写 snapshot.csv+code.csv，复用 stale-fix 模式）+ 构造 `Engine` + `.start()` + **轮询 `engine._tickfile_dequeue_count`**（无锁引擎计数器，测试可读）直到处理完 0902 → `.stop()`。不新增生产 test-only 注入点（零侵入）。spec 明确此 seam。
 
 ## 4. 崩溃场景全覆盖（C7 修订：不依赖 rows/marker 精确区分）
 

@@ -507,3 +507,32 @@ spec 经 4 轮共修：§3.1（marker 写入 + INV-CM-MONO/BATCH）、§3.2（re
 
 ### Review log 文件路径
 * `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
+
+---
+
+## Review Round 5（新逻辑交互深度复审）
+
+### 审核时间
+* 2026-06-17 20:40:00
+
+### Agent 原始摘要（简短）
+- **Agent 1（正确性）**：0 Critical。2 Major — M-R5-1（分支 2 "skip+add committed" 跨模块职责歧义：write_tickfile_rows 模块函数持文件锁、无法访问 flusher 的 SharedState skip-set，职责未切分）；M-R5-2（分支 2 skip 消费 seqno（L621）但无行落盘 → shutdown+restart 后 recovery 返回 last_seqno=N-1 覆盖 → 下次写重用 N → seqno 碰撞，**真实边界 bug**）。
+- **Agent 2（并发/性能/平台）**：0 Critical。4 Major — M-R5-1（pidfile guard TOCTOU + stale 死锁，需 O_CREAT|O_EXCL 原子 + pid liveness）；M-R5-2（recovery 频率无退避，但 writer restart_count 硬上限=1 → 最多 2 次全扫后永久死，需文档+metric）；M-R5-3（**Windows**：REGEN-GUARD 分支 1 truncate 必须在 `open(path,"a")` 之前用 `os.truncate(path)`，不能 f.truncate() 内 truncate → win32 稀疏空洞）；M-R5-4（audit log 写失败语义未定义 + 跨日并发，需 best-effort try/except + makedirs + 独立行原子写）。
+- **Agent 3（测试 seam/运维）**：0 Critical。2 Major — M-R5-1（**强制 E2E live restart 测试无 feed seam**：Engine.start() 线程阻塞、无 test-only 注入点，spec 承诺了测不了的测试 → 须命名注入机制）；M-R5-2（`recover_tickfile_seqno` 在 `flusher.__init__`（engine `__init__`）**急切调用**，早于 start() recovery → INV-CM-ORDER-2 只覆盖 start()，**__init__ seqno 从 partial 文件取 → 真实时序 bug**）。
+
+### 综合问题清单（去重 → 7 Major）
+
+| ID | 来源 | 问题 | 决议 | 状态 |
+| -- | ---- | ---- | ---- | ---- |
+| M-R5-1 | A3 | recovery 须在 `flusher.__init__` seqno 点执行（非 start()）；__init__ 急切取 seqno 早于 start recovery | §3.3 INV-CM-ORDER-1/2 修正插入点为 flusher.__init__ | Accepted |
+| M-R5-2 | A1 | 分支 2 skip 消费 seqno 无行落盘 → restart 后 seqno 倒退/重用 | §3.3 INV-CM-SEQNO-MONO-FILE（覆盖取 max，不倒退） | Accepted |
+| M-R5-3 | A1 | 分支 2 skip+add committed 跨模块职责歧义 | §3.4 INV-CM-SKIP-DELEGATION（writer 仅 file-skip，flusher 统一 add） | Accepted |
+| M-R5-4 | A2 | pidfile guard TOCTOU + stale 死锁 | §3.4 INV-CM-GUARD-ATOMIC（O_CREAT\|O_EXCL + pid liveness） | Accepted |
+| M-R5-5 | A2 | Windows truncate-vs-append-fd 顺序（win32 稀疏空洞） | §3.4 INV-CM-TRUNCATE-BEFORE-OPEN（os.truncate(path) 先于 open("a")） | Accepted |
+| M-R5-6 | A2 | audit log 写失败语义 + 跨日并发 + schema 缺 pid/hostname | §3.4 INV-CM-AUDIT-BESTEFFORT + schema 加 pid/hostname + makedirs | Accepted |
+| M-R5-7 | A2/A3 | restart 频率文档 + perm_dead metric；E2E feed seam 命名 | §3.4 文档 restart_count=1 上限 + metric；§7 命名 seed csv_dir+poll seam | Accepted |
+
+Minor（Deferred）：tail 窗口优化（m-R5-1 复用既有 4096 读）、运行时备份清理上限、health-check 用 per-append precondition 而非全扫、m-R2-A1a 一行澄清、空分钟 rowcount=0 一行澄清。
+
+### Round 5 结论
+**3. 需要修改后进行 Round 6 复审。**（7 Major Accepted。其中 M-R5-1/M-R5-2 是 seqno 真实时序 bug，M-R5-5 是 Windows 平台正确性，必须在 spec 闭环。）
