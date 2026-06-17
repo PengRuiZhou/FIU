@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 11 轮 review（R1-6 in-file + R7-8 sidecar + R9-10 集成 + R11 运维/性能/GIL），待 Round 12 复审。
+> **Status**: ✅ 12 轮 review 完成（6 组 × 2 轮），sidecar + fcntl.flock 方案可进入 planning。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`

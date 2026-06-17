@@ -813,3 +813,49 @@ Minor：lockfile makedirs 顺序（recovery 在首次写前需 makedirs lockfile
 
 ### Round 11 结论
 **3. 需要修改后进行 Round 12 复审。**（1 Critical + 8 Major。全新角度（性能/GIL/部署）发现了前 10 轮正确性/IO 聚焦未覆盖的运维层面风险——部署停止状态、config kill-switch、容器化、监控告警、GIL baseline。）
+
+---
+
+## Review Round 12（Round 11 修复后最终复审）
+
+### 审核时间
+* 2026-06-18 02:00:00
+
+### Round 11 复核
+Round 11 的 1 Critical（C-R11-1 部署停止）+ 8 Major（性能/GIL/config/容器/监控）全部在 §3.7 落实，经源码核实可实施。
+
+### 结论
+**1. 可以进入 planning。** 0 Critical / 0 Major 残留。5 Minor 全 Deferred 到 plan Task 0。
+
+---
+
+## 最终审核结论（12 轮后）
+
+### 是否可以进入 planning
+**1. 可以进入 planning。** ✅
+
+### 12 轮审核完整总览
+| 组 | 轮次 | 角度 | 发现 | 处理 |
+|---|---|---|---|---|
+| 1 | R1-2 | in-file 正确性 | 8C+10M | 全修 |
+| 2 | R3-4 | 动态运行时 | 3C+12M | 全修 |
+| 3 | R5-6 | 新逻辑接缝 | 7C+2M | 全修 |
+| — | — | **用户确认** | csv→sidecar / 多进程→flock | pivot |
+| 4 | R7-8 | sidecar+flock | 5C+11M | 全修 |
+| 5 | R9-10 | 集成交互 | 2C+9M | 全修 |
+| 6 | R11-12 | 运维/性能/GIL | 1C+8M | 全修 |
+
+**累计**：26 Critical + 52 Major + ~35 Minor（全 Deferred 到 plan Task 0）。
+
+### plan Task 0 必须处理
+1. §7 ~31 条 [DEPRECATED] in-file 测试逐条重写为 sidecar 等价（**最高优先**）
+2. §8 风险表 4 条 in-file 残留标 [Resolved]
+3. §3.4/§4/§9 "marker" → "sidecar 行" 术语统一
+4. 行号核实（writer.py:301/338；replay.py:82）
+5. enable_tickfile_commit_marker 老 config 缺字段防御式读取
+6. lockfile makedirs 顺序（recovery 首次写前）
+7. ~13 条历史 Deferred Minor 逐条 review
+8. 外部消费方 `#` 行兼容（部署前人工确认）
+
+### Review log
+* `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
