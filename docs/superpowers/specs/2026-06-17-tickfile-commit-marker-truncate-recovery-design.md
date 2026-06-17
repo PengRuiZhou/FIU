@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 10 轮 review 完成（in-file R1-6 + sidecar R7-8 + 集成 R9-10），sidecar + fcntl.flock 方案可进入 planning。
+> **Status**: ✅ 11 轮 review（R1-6 in-file + R7-8 sidecar + R9-10 集成 + R11 运维/性能/GIL），待 Round 12 复审。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -196,6 +196,34 @@ POSIX 唯一的原子文件操作是 `rename`（整个文件替换）；**没有
 
 **M-R9-4 — add(minute_key) 须在 sidecar fsync 之后**
 - **INV-CM-ADD-AFTER-SIDECAR**：`_state._generated_tickfile_minutes.add(minute_key)`（flusher.py:660）必须在 `write_tickfile_rows` 返回后执行，且 `write_tickfile_rows` 内 sidecar append+fsync 在 `add` 之前完成（INV-CM-SIDECAR-IN-LOCK）。禁止 `add` 在 sidecar fsync 之前（否则 restart 时内存 set 有但 sidecar 无 → 当 gap 重生 → 重复）。**当前代码已遵守**（add 在 write 返回后），此 INV 锁定时序防回归。
+
+### 3.7 Round 11 运维 / 性能 / GIL / 部署增补
+
+前 10 轮聚焦正确性/IO/并发；Round 11 从**性能影响、Rust 去 GIL 集成、部署/升级工作流**三个全新角度审查，发现以下运维层面风险。
+
+**C-R11-1 — 首次部署须引擎停止状态**
+- **INV-CM-DEPLOY-STOPPED**：commit-marker 代码首次部署必须 **stop → upgrade → start**（绝不能 live 运行时 rsync）。`fiu-minute-bar.service`（Restart=on-failure）的 systemd 路径安全（restart = 完全停止后重启）。但手动 `setup.sh`/rsync 必须先 `systemctl stop`。原因：`__init__` eager recovery（INV-CM-ORDER-1）在引擎启动瞬间跑——若旧进程仍在写 tickfile + 新代码 `__init__` recovery 并发 → 无 flock 保护（旧代码无 flock）→ 数据损坏。旧进程停止后新 `__init__` recovery 才安全。
+
+**M-R11-3 — config 开关 enable_tickfile_commit_marker**
+- 新增 `RecoveryConfig.enable_tickfile_commit_marker: bool = True`。False 时：`write_tickfile_rows` 跳过 sidecar append + flock；`_recover_tickfile_to_last_commit` 总返回 `had_sidecar=False`（降级 row-based）。
+- 符合项目惯例（`enable_order_accel` pattern）。运维 kill-switch：改 config + restart（无需 full code rollback）。
+
+**GIL baseline（Maj-R11-1/2/3）**
+- **tickfile-writer 线程不在 Phase 21 去 GIL 范围**——Phase 21 仅 order/snapshot 两条管道去 GIL（`py.allow_threads`）；tickfile 路径本就全程持 GIL（Python `write_tickfile_rows` 或 Rust `tickfile_generate` 全程持 GIL，lib.rs 注释明写 "GIL held ~50ms"）。**sidecar append 不引入新 GIL 回归**——它叠加在已持 GIL 的临界区上。
+- **sidecar 第 2 次 fsync GIL 增量**：每分钟多持 GIL ~5-20ms（SSD/HDD fsync 延迟）。order/snapshot Rust 线程在 tickfile-writer 持 GIL 的微秒级 flock/fstat 期间不受阻（NB + syscall 级）。实时峰值 12.7K lines/s、6.9x 余量下可吸收（memory phase21-status Q2）。§8 风险表加一行。
+- **Rust tickfile_generate 兼容**：sidecar 设计同时兼容 (a) 当前 Python per-row append + (b) 未来 Rust whole-string write——两路径的 `fsync→fstat→sidecar append+fsync` 序列不变（INV-CM-ORDERED-TWO-FILE / INV-CM-SIDECAR-IN-LOCK 路径无关）。
+
+**性能（M-R11-1/2 + minors）**
+- **sidecar 末行读取**：REGEN-GUARD precondition 读 sidecar 末行——用 **tail-read**（`f.seek(-min(size,4096),2)`，复用 writer.py:386-391 模式），**禁止 `readlines()`**。sidecar 全天 ~16KB，tail-read 毫秒级。
+- **writer retry 是 queue-serial bounded**（非 hot-loop）：每次重试 = queue.get(timeout=0.5) → 处理一分钟 → 失败 re-insert → 下次 iteration。连续 N 次后线程终止（engine.py:1299-1305）。flock/sidecar 开销随重试线性增加，但相对于失败的 fsync + ~4505 行重建可忽略。
+
+**容器化（M-R11-4）**
+- **INV-CM-CONTAINER**：不支持共享可写卷上多 FIU pod/容器。容器化须 `RecP=1`（单副本）或独占 per-pod volume。K8s `ReadWriteMany` PVC HA 打破 flock + SINGLEPROC。K8s rolling update 须 preStop hook + terminationGracePeriod > engine stop time。
+
+**监控告警（M-R11-5）**
+- metrics 是进程内（内存 int），硬崩溃丢失。**唯一持久信号 = audit log**（`tickfile_recovery.log` JSON-lines）。
+- 最小告警查询（运维 runbook）：`tail -F tickfile_recovery.log | jq 'select(.result=="error" or .truncate_bytes>0 or .had_sidecar==false)'`。
+- `tickfile_writer_perm_dead`（M-R5-7）须路由到 `logger.critical`（→ rotated `errors.log`），不能仅存内存 metric（硬崩溃前 writer 已死 → 无 CHECK 路径 → 运维看不到）。
 
 ## 4. 崩溃场景全覆盖（C7 修订：不依赖 rows/marker 精确区分）
 
