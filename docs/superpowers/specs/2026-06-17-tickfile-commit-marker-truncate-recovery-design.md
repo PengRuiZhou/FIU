@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ Review 通过（R1: 7C+6M；R2: 1C+4M；R3: 3C+10M；R4: 2M；R5: 7M；R6: 2M 全修复），可进入 planning
+> **Status**: ⚠ 重大修订（6 轮 review 后）：marker 从 in-tickfile `#COMMIT` 改为 **sidecar `.commit` 文件**（用户确认下游 csv/pandas 兼容）+ **fcntl.flock 跨进程锁**（用户确认 live+replay 真并发 + Linux）。§3.1/§3.2/§5/§6 已重写为 sidecar；§7 测试 / §8 风险表的 in-file-marker 部分需同步更新（见各节修订注）。**建议针对 sidecar 修订再做 1 轮 review**（in-file 方案的 6 轮 review 中 marker 相关项已随废弃，但 sidecar 新增 sidecar-crash-safety/sidecar-loss/two-file-ordering/flock-integration 等新风险点）。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -36,71 +36,62 @@ POSIX 唯一的原子文件操作是 `rename`（整个文件替换）；**没有
 **方案选择**：保留 daily 单文件（消费方依赖），用 **commit-marker + truncate** 实现等效原子性（本设计）。
 （per-minute 原子方案 A 因布局变化被否决——见 §10。）
 
-## 3. 设计：commit marker 作为"提交点"
+## 3. 设计：sidecar commit 文件作为"提交点"（用户确认后修订）
 
-### 3.1 Marker 写入（单一 chokepoint：`write_tickfile_rows`）
+> **⚠ 修订（6 轮 review 后，用户确认下游 csv/pandas 兼容 + 多进程）**：原 in-tickfile `#COMMIT` marker **破坏 csv 格式**（pandas 不跳 `#`、csv.reader 字段错位），已废弃。改为 **sidecar commit 文件**（tickfile 保持纯净）+ **fcntl.flock 跨进程锁**（live+replay 真并发）。本节（§3.1/§3.2）以此修订为准；§5 tail-check、§6 rollback 因此**大幅简化**（C1/C5 自动消除）。
 
-每分钟的数据行写完后，紧接着追加一条 **commit marker** 作为该分钟写入的最后行，然后 flush+fsync。
-**marker 的 fsync = 该分钟的提交点**：
+### 3.1 Sidecar 写入（tickfile 纯净 + 边车提交记录）
 
+**tickfile 保持纯净**——只有数据行（每 symbol 每分钟 1 行，65 字段），**无 marker 行**。下游 csv/pandas 零改动。
+
+**提交点放在 sidecar 文件** `tickfile_{date}.csv.commit`（与 tickfile 同目录，下游不读）：
 ```
-... 0932 的 ~4505 行 ...
-#COMMIT,202605280932,4505        ← 0932 提交点（此前的 rows 已 fsync）
-... 0933 的 部分行 ...            ← 💥 崩溃在此（无 0933 marker）
+202605280931,1234567,4505,331
+202605280932,2345678,4505,332
+...
 ```
+格式 `<minute_key>,<tickfile_byte_offset>,<rowcount>,<seqno>`（每行 = 一个已 commit 分钟）：
+- `minute_key`：该分钟。
+- `tickfile_byte_offset`：该分钟最后数据行写入后 tickfile 的字节大小（= commit 边界，truncate 锚点）。
+- `rowcount`：实际写入 rows 数（`len(rows)`，诊断）。
+- `seqno`：该分钟 seqno（recovery 直接取，免扫 tickfile）。
 
-- **格式**：`#COMMIT,<minute_key>,<rowcount>`（3 字段，`#` 开头）。
-  - `recover_tickfile_seqno` 和数据行 reader 用 `len(fields)==65` 判数据行 → marker（3 字段）被自动跳过。
-  - 外部消费方按惯例跳过 `#` 注释行。
-  - **rowcount = 实际写入的 rows 行数**（`len(rows)`，即 `build_tickfile_row` try/except 后的存活数），**不是** `len(selected)`。仅诊断用途，recovery 不强校验（见 §3.2 M3：不一致仅 WARNING）。
-- **两条写路径都覆盖**（`write_tickfile_rows` 是 live `_try_generate_tickfile` 和 replay `_flush_snapshot_minute` 的唯一公共入口）：
-  - atomic-create 路径（文件不存在）：content = `header + rows + marker`，整体 tmp+rename 原子。
-  - append 路径（文件存在）：rows + marker 一起 append，flush+fsync；marker 的 fsync 即提交点。
-- 因为 live 生成的分钟和 replay 生成的分钟都走 `write_tickfile_rows`，**两类分钟都打 marker**。
+**写一个分钟（提交）的顺序**（INV-CM-ORDERED-TWO-FILE，取代原 INV-CM-BATCH）：
+1. 向 `tickfile_{date}.csv` append 该分钟 ~4505 数据行 → flush + fsync。
+2. 记录此刻 tickfile 字节大小 = `offset`。
+3. 向 `tickfile_{date}.csv.commit` append `<minute>,<offset>,<rowcount>,<seqno>` → flush + fsync。
+4. **sidecar 这行的 fsync = 提交点**（tickfile rows 已先 fsync）。
 
-**关键不变量（C7/M1）**：
-- **INV-CM-MONO**：recovery **不依赖** rows 与 marker 之间的崩溃精确区分（kernel 按 page 刷回，不可靠区分）。它只依赖单调性——**marker 落盘 ⟺ 该分钟完整**；marker 未落盘（含 rows 部分写 / marker 部分写 / marker 完全没写）→ 一律 truncate 到上个合法 marker。
-- **INV-CM-BATCH**（仅 append 路径）：append 路径中 rows 与 marker 必须在**同一** `open(path,"a")` context 内**连续写入**，共用**单次** `f.flush()` + `os.fsync()`。**禁止**拆成两次 write 或两次 fsync（否则出现"rows 已 fsync 但 marker 未写"→完整数据被当 partial 删→重生重复）。atomic-create 路径由 tmp+rename 原子性保证，**不约束 fsync 次数**，但 content 必须以 marker 结尾（`header + "\n" + rows + "\n" + marker + "\n"`）——测试 `test_atomic_create_includes_marker` 反向兜底。
+- **单一 chokepoint**：`write_tickfile_rows`（live `_try_generate_tickfile` + replay `_flush_snapshot_minute` 公共入口）负责步骤 1；步骤 2-3 由其调用方在 write 成功后追加 sidecar（或 write_tickfile_rows 内一并做，持同一 flock）。
+- **关键不变量 INV-CM-MONO（沿用）**：recovery 只依赖单调性——**sidecar 行落盘 ⟺ 该分钟 tickfile 数据完整落盘**（因步骤 1 fsync 先于步骤 3）；sidecar 行未落盘 → tickfile 该分钟数据视为未 commit → truncate。
+- **INV-CM-ORDERED-TWO-FILE**：tickfile rows 的 append+fsync 必须**严格先于** sidecar 行的 append+fsync。禁止逆序（否则 sidecar 记录了未落盘的 offset）。
 
 ### 3.2 恢复函数（共享）：`_recover_tickfile_to_last_commit(output_dir, date)`
 
-新增于 writer.py（与 `recover_tickfile_seqno` 并列）。
+新增于 writer.py（与 `recover_tickfile_seqno` 并列）。**读 sidecar（几 KB，毫秒级），不扫 tickfile 1.5M 行**。
 
-**Path 构造（m2）**：`path = get_tickfile_path(output_dir, f"{date}0000")`（任一该日 minute_key 都解析到同一 per-day 文件）。
+**Path 构造**：tickfile `get_tickfile_path(output_dir, f"{date}0000")`；sidecar = `tickfile_path + ".commit"`。
 
-**Marker 合法性校验（C3）**——定义 `_parse_commit_marker(line) -> Optional[str]`，返回 minute_key 或 None：
-1. `line.startswith("#COMMIT,")`；
-2. `split(",")` 后恰好 3 字段；
-3. minute 字段为 12 位纯数字；
-4. rowcount 字段为非负整数（CRLF 残留 `4505\r` 等非纯整数 → 非法）。
-任何一项不满足 → 该位置**无合法 marker**（截断 marker / 损坏 marker 一律视为无 marker）。
+**Sidecar 行校验** `_parse_commit_line(line) -> Optional[tuple]`（返回 `(minute, offset, rowcount, seqno)` 或 None）：split(",") 后恰好 4 字段；minute 12 位数字；offset/rowcount/seqno 非负整数。任一不满足 → 该行非法（partial 末行 / 损坏）→ 跳过。
 
-**扫描 + truncate（C4/M4）**：
-- 在 `_get_write_lock(path)` 内执行（INV-CM-LOCK，TOCTOU 安全）。
-- 逐行扫描（跳过 header line_num==1），对每行调 `_parse_commit_marker`；合法则记录 `(minute_key, 字节偏移=该 marker 行首位置)`。
-- **truncate 点 = 字节偏移最大**的合法 marker（按文件位置，**不**按 minute_key 排序——防跨日错位误判）。
-- **truncate 偏移（C4）**：truncate 到该 marker 行**自身的换行符之后**——即**保留该 marker 行 + 其 `\n`**，文件以 `...#COMMIT,<minute>,<rowcount>\n` 结尾（INV-CM-LAST：truncate 后文件末行必为合法 marker）。这保证下次 append 不把已 commit 分钟当 gap 重生。
-- 若该最后 marker 之后还有字节（未提交的部分分钟）→ **truncate 丢弃**；若文件恰好在最后 marker 换行处结束 → 不 truncate。
-- **备份（C4 + M-R3-3）**：truncate 前，若 `new_size < old_size`，把被丢弃的 `[new_size, old_size)` 字节复制到同目录 `tickfile_{date}.csv.truncated.{time_ns()}.{pid}`（**纳秒+pid** 杜绝同秒/同进程内 retry 双 truncate 碰撞覆盖）。**备份 IO 失败（磁盘满/权限）→ 不 truncate、记 CRITICAL、abort recovery**（文件保留 partial，降级 row-based，committed_set 仅含 marker minutes，由后续 append+recovery 兜底）——绝不"备份失败仍 truncate"（会永久丢取证）。
+**读 sidecar + truncate（在 `flock` + 进程内 `_get_write_lock` 内，INV-CM-LOCK）**：
+- 读 sidecar 全部合法行 → 取**最后一行**（= 最后 commit）的 `offset` = truncate 锚点；`committed_set` = 所有合法行的 minute（**INV-CM-DATE-FILTER**：只收 `minute.startswith(date)`；跨日 WARNING 不纳入）。
+- 若 tickfile 当前 size > `offset`（有未提交 partial 分钟）→ **truncate tickfile 到 `offset`**（INV-CM-FAIL-ATOMIC：读 sidecar 在 try 内，仅成功才 truncate）。sidecar 自身**不 truncate**（partial 末行由校验跳过，下次 append 续写）。
+- **备份（C4/M-R3-3）**：truncate 前，被丢弃 `[offset, old_size)` 字节复制到 `tickfile_{date}.csv.truncated.{time_ns()}.{pid}`；**备份 IO 失败 → 不 truncate、CRITICAL、abort**（文件留 partial，降级，committed_set 仅含 sidecar 已记录分钟）。
+- 返回 `(committed_set, last_seqno, had_sidecar)`：`last_seqno` = sidecar 最后一行 seqno（**M-R3-4**：免扫 tickfile；`recover_tickfile_seqno` 改薄包装/废弃）。覆盖 `_tickfile_seqno` 取 `max(file_last_seqno, 当前)`（**INV-CM-SEQNO-MONO-FILE**，M-R5-2）。
 
-**committed_set 来源（M2/M4/M-R3-4/M-R3-5）**：
-- 返回 `(committed_set, last_seqno, had_markers)`（**M-R3-4**：recovery 在 truncate 后的文件上**同一函数同一锁内**返回 `last_seqno`——只来自 committed 行，防 seqno/recovery 时序窗口；`recover_tickfile_seqno` 改薄包装或废弃）。
-- `had_markers=True`：`committed_set` = **所有合法 marker 的 minute 集合**（set 去重，处理 dup）∪ **marker 之前所有 65-字段数据行对应的 minute**（覆盖混存）。
-- **INV-CM-DATE-FILTER（M-R3-5）**：committed_set 收集时只收 `minute.startswith(date)` 的 marker/行；发现跨日 marker（minute 前缀 ≠ date）→ WARNING `cross_day_marker`，不纳入 set。
-- `had_markers=False`（老文件无 marker 且有数据）：`committed_set=None` → 调用方降级 row-based `_extract_minutes`（不 truncate）。
-- 无数据行无 marker（空文件/仅 header）：`had_markers=False`，`committed_set=set()`，不 truncate。
+**Sidecar 丢失/降级（had_sidecar）**：
+- sidecar 存在 → `had_sidecar=True`，committed_set 来自 sidecar，truncate 到最后 commit offset。
+- sidecar **不存在**但 tickfile 存在（老文件/无 sidecar，或 sidecar 误删）→ `had_sidecar=False`，`committed_set=None` → 调用方降级 row-based `_extract_minutes`（**不 truncate**，保守）。记 WARNING `sidecar_missing_fallback`。可选：replay-to-fresh 重建 sidecar。
+- tickfile 不存在 → `had_sidecar=False`，`committed_set=set()`，不 truncate（纯首跑）。
 
-**一致性校验（M4）**：扫描中若发现 dup marker（同 minute 多次）或 minute_key 按字节偏移非严格递增 → 记 WARNING（可能跨日错位/重复写），**不阻断** recovery。
+**一致性校验（M4）**：sidecar 中 minute 非严格递增 / dup → WARNING（跨日错位/重复写信号），**不阻断**。
 
-**rowcount 校验（M3）**：对每个合法 marker，若其 rowcount ≠ 该分钟实际 65-字段行数 → 记 WARNING（`build_tickfile_row` 异常信号），**不阻断**。
+**可观测性（M5/M-R3-8）**：recovery 完成后结构化 log + 持久 audit log `output_dir/tickfile/tickfile_recovery.log`（JSON 行 `{ts,date,pid,hostname,had_sidecar,committed_count,last_commit_minute,truncate_bytes,result}`，**INV-CM-AUDIT-BESTEFFORT** try/except 不阻断）。metric：`tickfile_recovery_truncate_bytes`/`_committed_minutes`/`_had_sidecar`/`_invocations`。
 
-**可观测性（M5）**：recovery 完成后输出结构化 log（truncate 发生时 WARNING，否则 INFO）：
-```
-tickfile_recovery: date={date} had_markers={bool} committed_minutes={n}
-  last_commit_minute={mk} markers_found={n} truncate_bytes={b}
-  pre_size={pre} post_size={post} backup={path_or_none}
-```
-metric（接入 engine 现有 `_tickfile_*` 计数器家族）：`tickfile_recovery_truncate_bytes`（累计）、`tickfile_recovery_committed_minutes`、`tickfile_recovery_had_markers`、`tickfile_recovery_invocations`。
+**跨进程锁（用户确认 #2+#3，Linux fcntl.flock）**：
+- **INV-CM-FLOCK**：recovery 的 truncate + writer 的 append（tickfile 与 sidecar）必须持 **OS 级 `fcntl.flock(lockfile, LOCK_EX)`**（Linux 生产）/ `msvcrt.locking`（Windows 测试）。lockfile = `tickfile_{date}.csv.lock`（专用，避免锁数据文件本身）。**进程内**仍叠 `_get_write_lock`（RLock，同进程线程互斥）；**flock 叠加**提供跨进程互斥。这取代原 INV-CM-SINGLEPROC 的"软"假设——现在 live+replay 真并发由 flock 硬保护（用户确认 replay 避开交易时段仍可能并发）。
+- replay guard（pidfile O_EXCL + pid liveness）保留为**额外防线**（拒绝明显冲突），flock 是底层硬保证。
 
 ### 3.3 调用方 + 时序不变量（C2）
 
@@ -183,48 +174,41 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 
 关键不变量（重申 INV-CM-MONO / INV-CM-LAST）：**文件有效内容 = 截到最后一个合法 marker**；truncate 后末行必为合法 marker。marker 之后的一切都是未提交的，可安全丢弃重生。
 
-## 5. 与现有 tail-check / newline-fix 的交互（C1 闭环）
+## 5. tail-check / newline-fix（sidecar 修订后：C1 自动消除）
 
-现有 `write_tickfile_rows` append 路径有尾部 newline-fix（读尾部，若最后一行 `len(fields)!=65` → 补 `\n`）。
-**加 marker 后，健康文件的最后一行是 marker（3 字段）而非数据行**，旧逻辑会误判（`3 != 65` → 每次正常 append 前插多余 `\n` → 文件累积空行污染）。
+**sidecar 修订后，tickfile 只有数据行（65 字段），无 marker 行**。现有 `write_tickfile_rows` append 路径的 tail-check（`len(fields)!=65` → 补 `\n`）**无需修改**——健康文件末行永远是 65 字段数据行 → `len==65` → 合法 → 不触发 fix。
 
-**必须在 spec 写死的修改（不再推到 plan）**——tail-check 合法末行谓词改为（C-R2-1：复用 §3.2 严格校验，**非**前缀匹配）：
-```python
-def _is_legal_last_line(line):
-    """合法最后一行 = 65 字段数据行 或 通过 _parse_commit_marker 的合法 marker。
-    截断/损坏 marker（如 '#COMMIT,2026052809' 仅 2 字段）→ 非法 → 触发 newline-fix 隔离。"""
-    fields = line.split(',')
-    if len(fields) == 65:
-        return True
-    return _parse_commit_marker(line) is not None   # 复用 §3.2 同一严格 4 规则校验
-```
-**关键（C-R2-1）**：`fields[0]=="#COMMIT"` 前缀匹配**不安全**——会把截断 marker（`#COMMIT,2026052809` 等）误判合法 → 不补 `\n` → 下次 append 数据行粘到截断 marker 后形成坏行。必须复用 `_parse_commit_marker`（严格：prefix + 3 字段 + 12 位 minute + 非负整数 rowcount），与 recovery 用**同一套**合法性标准。`need_newline_fix` 仅当最后一行既非 65 字段也非合法 marker 才为 True；截断 marker（非法）→ fix（补 `\n` 隔离成独立行，待 recovery 清）。
+**原 C1（marker 行 3 字段误判）自动消除**——不再有 marker 行进 tickfile。原 §5 的 `_is_legal_last_line` 谓词、C-R2-1 截断 marker 处理**全部不再需要**（已随 in-file marker 废弃）。
 
-协同：recovery 的 truncate-to-last-marker 在启动时做一次性精确恢复（保证文件以合法 marker 结尾）；newline-fix 在每次 append 前做尾部保护（防止上一次 append 被 mid-append 截断的残留）。两者用**同一** `_parse_commit_marker`，标准统一，不冲突。
+newline-fix 仍保留原有职责（防上一次 append mid-截断的 partial 数据行残留），与 sidecar recovery 协同：recovery 在启动/重启时按 sidecar offset 做精确 truncate；newline-fix 在每次 append 前做尾部保护。两者互不干扰（tickfile 无 marker，谓词不变）。
 
 ## 6. 向后兼容 + 回滚安全（C5/M2/m3）
 
 **新代码读老文件（前向）**：
-- 新文件（新代码写）：有 marker → marker 模式 + truncate。
-- 老文件（部署前生成，无 marker，有数据行）：`had_markers=False` → 降级 row-based presence，不 truncate。接受极小 partial 风险，或一次性 replay-to-fresh-dir 重生。
-- 空文件（仅 header，无数据无 marker）：`had_markers=False`，`committed_set=set()`，不 truncate。
+- 新文件（新代码写）：有 sidecar → sidecar 模式 + truncate。
+- 老文件（部署前生成，无 sidecar，有数据行）：`had_sidecar=False` → 降级 row-based presence，不 truncate。或一次性 replay-to-fresh-dir 重生（同时重建 sidecar）。
+- 空文件（仅 header）：`had_sidecar=False`，`committed_set=set()`，不 truncate。
 
-**混存文件（M2，滚动升级场景）**：新代码首次 append 到老文件 → 文件 = `[老 row-only 分钟][新 marker 分钟]`。
-- `had_markers=True`（发现新 marker）→ `committed_set` = marker 分钟 ∪ **marker 之前所有 65-字段行的分钟**（§3.2 committed_set 来源）。
-- 老分钟不丢、不被 replay 当 gap 重生 → 无重复。
-- 检测到此混存（首个 marker 之前存在 65-字段行）→ WARNING `tickfile_recovery: legacy_mix_minutes=N`（提示可 replay-to-fresh 清理）。
+**混存文件（滚动升级）**：新代码首次写老 tickfile → 写数据行 + 建 sidecar。之后 recovery 读 sidecar（committed = sidecar 分钟）。**老 row-only 分钟（sidecar 建立前的）**：因 sidecar 不含它们 → 不在 committed_set → replay 会当 gap 重生 → **重复**。缓解：首次升级时一次性 replay-to-fresh 重建 tickfile + sidecar（用户确认源 csv 不滚动删除，#4，replay-to-fresh 永远可行）；或 recovery 检测"tickfile 有数据但 sidecar 首 offset > 0"→ WARNING + 把 offset 之前的数据行分钟纳入 committed_set（保守，接受首段 partial 风险）。
 
-**老代码读新文件（回滚，C5）**——必须文档化的风险：
-- 回滚到旧代码后，旧 `write_tickfile_rows` 的 tail-check（`len!=65` 判截断）会把 `#COMMIT,...`（3 字段）误判为截断行 → 每次 append 前插一个多余 `\n`。
-- 影响：文件累积空行。**内部 reader（`recover_tickfile_seqno` / `_extract_minutes`）按 `len!=65` 跳过空行不崩**；但外部严格 CSV consumer 可能解析失败。
-- 风险定性：**非破坏性数据损坏**（空行可被跳过/清理），但需告知。
-- **Rollback playbook**（写入部署文档）：
-  0. **（清理前必做，M-R3-6）验证源数据存在**：`input_dir/snapshot.csv.{date}` + `code.csv.{date}` 仍在保留窗口内。**若缺失 → 不要删/覆盖受污染 tickfile**（空行可被跳过、数据保留），改用 `grep -v '^$'` 清空行即可。replay-to-fresh 依赖源数据，源被滚动删除则无法重生。
-  1. 回滚前统计：`grep -c '^#COMMIT' tickfile_*.csv` 确认哪些文件有 marker。
-  2. 回滚后若需清理空行且源数据在：`replay-to-fresh-dir` 重生当天 tickfile（或 `sed` 删空行）。
-  3. 优先策略：回滚窗口期内暂停 live tickfile 写入，用 replay 重生。
+**老代码读新文件（回滚，C5——sidecar 修订后自动消除）**：
+- tickfile **纯净**（只 65 字段数据行，无 marker）→ 旧代码读它**完全正常**（tail-check `len==65` 合法、csv/pandas 正常）。**原 C5 空行污染风险消除**。
+- sidecar `tickfile_{date}.csv.commit` 是新文件，旧代码不读它（忽略）→ 无影响。回滚后 sidecar 残留无用（可删，下次新代码重建）。
+- **Rollback playbook**（简化）：
+  0. 验证源数据存在（用户确认 #4 不滚动删除 → 始终可行）。
+  1. 回滚后若需清理：旧代码正常读写纯净 tickfile；sidecar 残留可忽略或删。
+  2. 无需 `grep` 清空行（tickfile 本就纯净）。
 
 ## 7. 测试计划（TDD，C6 补强）
+
+> **⚠ sidecar 修订注**：以下"in-file marker"相关测试（marker 写入/截断 marker/混存 marker/tail-check marker 等）**随 in-file marker 废弃**，改为 sidecar 等价测试。仍适用者（fail-atomic、seqno-monotonic、writer retry 三分支、guard、restart、feed seam、audit）保留。**新增 sidecar 专项**：
+> - `test_sidecar_write_after_tickfile_fsync`（INV-CM-ORDERED-TWO-FILE：tickfile fsync 先、sidecar fsync 后）。
+> - `test_recover_reads_sidecar_truncates_tickfile_to_offset`（读 sidecar → truncate tickfile 到 offset）。
+> - `test_sidecar_partial_last_line_skipped`（sidecar 末行截断 → 校验跳过，不污染 committed_set）。
+> - `test_sidecar_missing_falls_back_row_based`（sidecar 不存在 → 降级，不 truncate）。
+> - `test_sidecar_records_seqno_recovery_no_tickfile_scan`（last_seqno 来自 sidecar，免扫 tickfile）。
+> - `test_flock_excludes_cross_process`（fcntl.flock 跨进程互斥；两进程同 lockfile → 第二个阻塞/失败）。
+> - `test_tickfile_pure_no_marker_rows`（csv/pandas 读 tickfile 无 marker 行、无 `#`、65 字段一致——证 #1 兼容）。
 
 **Marker 写入**：
 - `test_write_tickfile_rows_appends_commit_marker`：写一分钟后，文件末行是 `#COMMIT,<minute>,<count>`。
