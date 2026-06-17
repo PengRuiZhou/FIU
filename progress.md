@@ -1050,3 +1050,31 @@ seqno=2  UpdateTime=20260528 08:30  LocalTime=08:00:00.040000  ✅ LocalTime 不
 
 ### 提交链
 实现 `d606692 → 79610c3`（8 commits）+ 边界细化 `76830d2`
+
+---
+
+## Session 26 — 2026-06-17 (Q1 tickfile stale-fix 实施 + E2E 验证 + commit-marker 设计)
+
+### Q1 tickfile stale-fix — ✅ 实施完成（subagent-driven，7 任务）
+方案 A（shutdown/cross-day 跳过 order 未到分钟 + replay 手术式补齐 gap）：
+- Part 1：`flush_all_remaining` + `_step1_cross_day_check` 加 `order_current_minute >= mk` 门控，
+  跳过 order 未到的 tickfile 分钟（不再写 stale carry-forward 行）。cross-day 把 skipped 从 pending 移除避免 Fix-G CRITICAL 误报。
+- Part 2：ReplayEngine 启动扫描 tickfile 的 `UpdateTime` 列（col 16）→ 已生成分钟集合 → replay 跳过已生成、只补 gap；seqno 续接。
+- 提交链 `a6f3c03 → 29439ce`（5 实现 commits）+ CHECK-1 fix `cba33c4`（shutdown 也 pop skipped，避免 CHECK 1 误报）。
+- 验证：8 新 TDD 测试（含 mutation-verified 集成测试：replay 补 gap 不腐败正确行）；全量 459 passed / 4 预存在失败（0 新增）。
+- Spec：`2026-06-16-tickfile-stale-fix-design.md`；Plan：`2026-06-16-tickfile-stale-fix.md`。
+
+### E2E 演示 — ✅ 真实 87M 行管道验证（`test/phase21_benchmark/stale_fix_demo.py`）
+两进程（避免 order daemon 线程竞争）：
+- Phase A（live 截断 order=0931，snapshot 到 1530）：shutdown 跳过 295 未到分钟，**0 stale 行**，`CHECK 3 PASS`，generated=33。
+- Phase B（replay 补 gap）：扫描识别 33 已生成分钟（skip），**补齐 293 gap 分钟**，33 正确分钟行数**逐一不变**（无腐败）。
+- 补齐数据真实（bid/ask 变化，非冻结 carry-forward）。
+- **断点分钟完整性深查**（用户质疑）：order 文件每分钟原子（tmp+rename）；断点 0931 symbol 覆盖 4505（全集）+ 采样比率 9.9×（与完整分钟 0930 的 10.3× 一致）→ **断点完整**，kill 只丢 in-progress 的 gap 分钟。
+
+### commit-marker 设计 — 📐 设计阶段（spec `26967f5`，未实施）
+E2E 讨论暴露**硬崩溃 mid-append gap**：tickfile 是 per-day append（非原子），硬崩溃在某分钟 append 中途 → 部分分钟；replay 扫描二值判"有行=完整"→ 跳过 → 永久部分缺失；append-only 又无法干净补齐（重复）。
+- 方案 B（选定，保留 daily 单文件）：每分钟 rows+fsync 后写 `#COMMIT,<minute>,<count>` marker（提交点）；
+  共享 `_recover_tickfile_to_last_commit()` truncate 到最后合法 marker（丢未提交部分分钟）+ 返回 committed 集合。
+- **replay + live 重启都调**（彻底恢复）；老文件（无 marker）降级 row-based 兼容。
+- 方案 A（per-minute 原子文件）因布局 breaking 被否决；`.tmp→append` 因 append 非原子被否决。
+- 待：写 plan → 实施。

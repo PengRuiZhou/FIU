@@ -1152,3 +1152,37 @@ Python `time_to_minute_key`（`datetime+timedelta`）与 Rust（手写进位 + `
 
 spec 原称"is_trading_minute 过滤 1531"是**错的**——`is_trading_minute`（clock.py）在 live 管道中
 **从无调用**。1531（现已是 1530）作为正常最后分钟 flush。非 bug，仅文档不准。
+
+---
+
+## Tickfile Stale-Fix + Mid-Append 恢复发现（2026-06-17，Session 26）
+
+### Finding 9: stale 行根因 = "停止时 order<snapshot"，非运行时 bug
+- live gate（`flusher.py:448` `order_current_minute > minute_key`）**正确**，运行时 0 抢跑（日志 "0 eligible"）。
+- stale 只来自两条**无检查的强制生成**：shutdown `flush_all_remaining` + cross-day `_step1_cross_day_check`。
+- 自然 EOF 停止（order=snapshot）→ 0 stale；order 落后停止 → gap 分钟 stale。
+- stale 永久残留：tickfile append-only + `_generated_tickfile_minutes` 不持久化 + snapshot 已 flush 不重生成。
+
+### Finding 10: stale-fix 方案 A（实施）— 门控跳过 + replay 扫描补齐
+- shutdown/cross-day 加 `order_current_minute >= mk` 门控（**>= 非 >**：自然 EOF 必须生成收盘 1530）。
+- replay 启动扫描 tickfile `UpdateTime` 列（col 16，minute_key 派生）→ 已生成分钟集合 → 跳过、只补 gap。
+- 扫描自包含（无 checkpoint 改动），反映文件真实状态；纯 replay 不受影响（无文件→空集→全生成）。
+- E2E 验证：live 截断 order=0931 → 0 stale + 33 generated；replay 补 293 gap + 33 正确分钟行数不变。
+
+### Finding 11: order 文件原子，tickfile 不原子（架构差异）
+- order/snapshot = **每分钟一个文件**，tmp+`os.replace` → 原子（完整或不存在）。
+- tickfile = **每天一个文件**，append → 非原子。POSIX 无"原子追加"，只有 rename（整文件替换）原子。
+- "`.tmp` 暂存 + 全量 append" **不原子**（append 那步可中断）；保留 daily + 原子只能整文件重写（O(n²)，~2.4 亿行，不现实）。
+- per-minute tickfile（方案 A）原子且 I/O 不增，但布局 breaking（否决）。
+
+### Finding 12: 硬崩溃 mid-append gap（stale-fix 未覆盖，commit-marker 解决）
+- tickfile per-day append → 硬崩溃在某分钟 append 中途 → 部分分钟（部分 symbol）。
+- replay 扫描**二值判**"有合法行=完整"→ 跳过部分分钟 → 永久部分缺失。
+- append-only 决定：即便检测出，replay 重生会 append → 重复，无法干净补。
+- 方案 B（选定）：每分钟 rows+fsync 后写 `#COMMIT,<minute>,<count>` marker（提交点）；`_recover_tickfile_to_last_commit` truncate 到最后合法 marker（丢未提交）+ 返回 committed 集；replay + live 重启都调。
+
+### Finding 13: 断点分钟完整性（order_current_minute = 已 flush，非 in-progress）
+- `order_current_minute` 在 `_drain_tickfile_triggers` 从 `_tickfile_trigger_pending` 设（`write_order_file` 成功后 append）= **最后已 flush 分钟**，非正在处理。
+- kill 永远发生在 in-progress 的下一分钟（gap 分钟），不损坏断点分钟（已原子 flush）。
+- E2E 实证：断点 0931 symbol 覆盖 4505（全集）+ 采样比率 9.9×（与完整分钟 0930 的 10.3× 一致）→ 完整。
+- order 文件行数 ~每分钟每 symbol 每 batch 一条（聚合视图，非源 tick 1:1）——源 436K tick → order 文件 ~44K 行是正常采样。

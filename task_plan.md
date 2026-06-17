@@ -941,3 +941,23 @@ PYTHONPATH=src python -m data_simulator --speed 100 --split-line-prob 0.01 --lat
 # 另一个终端启动 minute_bar live 模式
 PYTHONPATH=src python main.py --config config/config.ini
 ```
+
+---
+
+## Phase 23: Q1 Tickfile Stale-Fix `[complete]` + Commit-Marker `[planned]`
+
+### Phase 23a: Q1 stale-fix `[complete]`（2026-06-17，方案 A）
+- **Bug**: shutdown/cross-day 强制生成 order 未到的 tickfile 分钟 → stale carry-forward 行（永久残留）。
+- **Fix**: 
+  - Part 1: `flush_all_remaining` + `_step1_cross_day_check` 加 `order_current_minute >= mk` 门控，跳过未到分钟（cross-day + shutdown 都 pop skipped 避免 CHECK 误报）。
+  - Part 2: ReplayEngine 启动扫描 tickfile `UpdateTime` → 已生成分钟集 → 跳过、只补 gap。
+- **验证**: 8 新 TDD 测试（mutation-verified）+ E2E（87M 行，0 stale + gap 补齐 + 正确分钟不变）+ 459 passed。
+- **提交**: `a6f3c03 → 29439ce` + CHECK-1 fix `cba33c4`。
+- **Spec**: `2026-06-16-tickfile-stale-fix-design.md`。
+
+### Phase 23b: Commit-Marker + Truncate 恢复 `[planned]`（2026-06-17，方案 B，未实施）
+- **Bug**: 硬崩溃 mid-append → tickfile（per-day append，非原子）部分分钟；replay 二值扫描跳过 → 永久部分缺失；append-only 无法干净补（重复）。
+- **Fix**: 每分钟 rows+fsync 后写 `#COMMIT,<minute>,<count>` marker；共享 `_recover_tickfile_to_last_commit()` truncate 到最后合法 marker + 返回 committed 集；**replay + live 重启都调**；老文件（无 marker）降级 row-based。
+- **否决**: 方案 A（per-minute 原子文件，布局 breaking）；`.tmp→append`（append 非原子）。
+- **Spec**: `2026-06-17-tickfile-commit-marker-design.md`（commit `26967f5`）。
+- **待**: writing-plans → subagent-driven 实施。
