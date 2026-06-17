@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: Review Round 1 通过（7 Critical + 6 Major 已修复，见 review log），待 Round 2 复审
+> **Status**: ✅ Review 通过（Round 1: 7C+6M；Round 2: 1C+4M 全修复），可进入 planning
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -60,7 +60,7 @@ POSIX 唯一的原子文件操作是 `rename`（整个文件替换）；**没有
 
 **关键不变量（C7/M1）**：
 - **INV-CM-MONO**：recovery **不依赖** rows 与 marker 之间的崩溃精确区分（kernel 按 page 刷回，不可靠区分）。它只依赖单调性——**marker 落盘 ⟺ 该分钟完整**；marker 未落盘（含 rows 部分写 / marker 部分写 / marker 完全没写）→ 一律 truncate 到上个合法 marker。
-- **INV-CM-BATCH**：append 路径中 rows 与 marker 必须在**同一** `open(path,"a")` context 内**连续写入**，共用**单次** `f.flush()` + `os.fsync()`。**禁止**拆成两次 write 或两次 fsync（否则出现"rows 已 fsync 但 marker 未写"→完整数据被当 partial 删→重生重复）。
+- **INV-CM-BATCH**（仅 append 路径）：append 路径中 rows 与 marker 必须在**同一** `open(path,"a")` context 内**连续写入**，共用**单次** `f.flush()` + `os.fsync()`。**禁止**拆成两次 write 或两次 fsync（否则出现"rows 已 fsync 但 marker 未写"→完整数据被当 partial 删→重生重复）。atomic-create 路径由 tmp+rename 原子性保证，**不约束 fsync 次数**，但 content 必须以 marker 结尾（`header + "\n" + rows + "\n" + marker + "\n"`）——测试 `test_atomic_create_includes_marker` 反向兜底。
 
 ### 3.2 恢复函数（共享）：`_recover_tickfile_to_last_commit(output_dir, date)`
 
@@ -113,8 +113,10 @@ metric（接入 engine 现有 `_tickfile_*` 计数器家族）：`tickfile_recov
 **调用时序不变量（C2，生产正确性）**——必须在 spec 闭环，不能推到 plan：
 - **INV-CM-ORDER-1**：`_recover_tickfile_to_last_commit` 必须在 **`Engine.start()` spawn `_tickfile_writer_thread` 之前**调用（单线程，无并发）。插入点：engine.py `start()` 的 `enable_tickfile` 分支内、`self._tickfile_seqno = self._flusher._recover_tickfile_seqno()` 紧邻处，严格早于 `self._tickfile_writer_thread = Thread(...)`。否则 writer 线程已消费首个 minute 后再 truncate → 删掉刚写的合法行 → 丢数据。
 - **INV-CM-ORDER-2**：recovery（含 truncate）必须在 `recover_tickfile_seqno` **之前**完成（或 recovery 内部一次扫描同时返回 last_seqno）。否则 seqno 取到被 truncate 的分钟 → 倒退/跳号。
-- **INV-CM-SKIPSET**：recovery 返回的 `committed_set` 必须写入 live 引擎的 `self._state._generated_tickfile_minutes`（不只 replay）。否则 live writer 会重生已 commit 的分钟 → 重复行。
+- **INV-CM-SKIPSET-LIVE**：recovery 返回的 `committed_set` 必须写入 live 引擎的 `self._state._generated_tickfile_minutes`（`aggregator.SharedState` 字段，flusher 读写同一 set）。否则 live writer 会重生已 commit 分钟 → 重复行。
+- **INV-CM-SKIPSET-REPLAY**：replay 路径写入 ReplayEngine 自身的 `self._generated_tickfile_minutes`（replay.py 字段，**与 live 的 SharedState 字段是两个独立字段**）。两条路径各自必须设对应字段。
 - **INV-CM-LOCK**：recovery 的 truncate 持 `_get_write_lock(path)`；writer 线程也持同一 lock → 互斥安全（且因 INV-CM-ORDER-1 时序，实际无并发）。
+- **INV-CM-ORDER-RESUME**（cross-day resume）：`_tickfile_writer_resume()`（cross-day reset 后重建 writer 线程）**无需**调 recovery——因 cross-day 已 `_generated_tickfile_minutes.clear()` 且目标为**新 date 的 fresh 文件**（不存在/仅 header，无 partial）。若未来引入 same-day resume（同 date 文件续写），必须在该路径补 recovery + 时序同 INV-CM-ORDER-1。
 
 ## 4. 崩溃场景全覆盖（C7 修订：不依赖 rows/marker 精确区分）
 
@@ -133,15 +135,19 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 现有 `write_tickfile_rows` append 路径有尾部 newline-fix（读尾部，若最后一行 `len(fields)!=65` → 补 `\n`）。
 **加 marker 后，健康文件的最后一行是 marker（3 字段）而非数据行**，旧逻辑会误判（`3 != 65` → 每次正常 append 前插多余 `\n` → 文件累积空行污染）。
 
-**必须在 spec 写死的修改（不再推到 plan）**——tail-check 合法末行谓词改为：
+**必须在 spec 写死的修改（不再推到 plan）**——tail-check 合法末行谓词改为（C-R2-1：复用 §3.2 严格校验，**非**前缀匹配）：
 ```python
-def _is_legal_last_line(fields):
-    """合法最后一行 = 65 字段数据行 或 #COMMIT marker 行。"""
-    return len(fields) == 65 or (len(fields) >= 1 and fields[0] == "#COMMIT")
+def _is_legal_last_line(line):
+    """合法最后一行 = 65 字段数据行 或 通过 _parse_commit_marker 的合法 marker。
+    截断/损坏 marker（如 '#COMMIT,2026052809' 仅 2 字段）→ 非法 → 触发 newline-fix 隔离。"""
+    fields = line.split(',')
+    if len(fields) == 65:
+        return True
+    return _parse_commit_marker(line) is not None   # 复用 §3.2 同一严格 4 规则校验
 ```
-即 `need_newline_fix` 仅当最后一行**既非 65 字段也非 #COMMIT marker**（截断数据行 / 截断 marker / 非 UTF8）才为 True。marker 行（合法）→ 不 fix。
+**关键（C-R2-1）**：`fields[0]=="#COMMIT"` 前缀匹配**不安全**——会把截断 marker（`#COMMIT,2026052809` 等）误判合法 → 不补 `\n` → 下次 append 数据行粘到截断 marker 后形成坏行。必须复用 `_parse_commit_marker`（严格：prefix + 3 字段 + 12 位 minute + 非负整数 rowcount），与 recovery 用**同一套**合法性标准。`need_newline_fix` 仅当最后一行既非 65 字段也非合法 marker 才为 True；截断 marker（非法）→ fix（补 `\n` 隔离成独立行，待 recovery 清）。
 
-协同：recovery 的 truncate-to-last-marker 在启动时做一次性精确恢复（保证文件以合法 marker 结尾）；newline-fix 在每次 append 前做尾部保护（防止上一次 append 被 mid-append 截断的残留）。两者用同一 `_is_legal_last_line` 谓词，不冲突。
+协同：recovery 的 truncate-to-last-marker 在启动时做一次性精确恢复（保证文件以合法 marker 结尾）；newline-fix 在每次 append 前做尾部保护（防止上一次 append 被 mid-append 截断的残留）。两者用**同一** `_parse_commit_marker`，标准统一，不冲突。
 
 ## 6. 向后兼容 + 回滚安全（C5/M2/m3）
 
@@ -183,8 +189,9 @@ def _is_legal_last_line(fields):
 - `test_recover_no_truncate_when_clean_boundary`：两分钟都 commit + 文件正常结尾 → 不 truncate（§4 第三行）。
 - `test_recovery_holds_write_lock`：mock 断言 `_get_write_lock` 被 acquire（INV-CM-LOCK）。
 
-**Tail-check 协同（C1）**：
-- `test_tail_check_recognizes_marker_as_legal_last_line`：文件末行是 `#COMMIT,...` → append 下一分钟不插多余 `\n`。
+**Tail-check 协同（C1 + C-R2-1）**：
+- `test_tail_check_recognizes_marker_as_legal_last_line`：文件末行是合法 `#COMMIT,...` → append 下一分钟不插多余 `\n`。
+- `test_tail_check_truncated_marker_triggers_newline_fix`（C-R2-1）：末行是截断 marker（`#COMMIT,2026052809`，2 字段）→ `_is_legal_last_line` 返回 False → `need_newline_fix=True`（隔离成独立行，待 recovery 清）。
 
 **混存 + 兼容**：
 - `test_recover_legacy_mix_includes_row_only_minutes`：[老 0930 rows][老 0931 rows][新 0932 rows+marker] → committed_set ⊇ {0930,0931,0932}（M2）。
@@ -196,8 +203,9 @@ def _is_legal_last_line(fields):
 - `test_seqno_recovery_after_truncate_excludes_dropped_minute`：truncate 后 seqno 不指向已删分钟（INV-CM-ORDER-2）。
 - `test_live_recovery_populates_skipset`：recovery 后 `_state._generated_tickfile_minutes` 含 committed（INV-CM-SKIPSET）。
 
-**端到端（C6，核心价值证明）**：
-- `test_e2e_mid_append_crash_recovery`：用 helper 写 `[header + 0901 rows + #COMMIT,0901,N + 0902 partial rows (no marker)]`，调 `ReplayEngine.run()` with snapshot 含 0901+0902 → 断言：最终 `#COMMIT` 数=2、0901 行数不变、0902 行数=预期、无空行无重复。模板：stale-fix `test_replay_fills_gap_without_corrupting_correct_rows`。
+**端到端（C6 + M-R2-2，核心价值证明，双路径）**：
+- `test_e2e_mid_append_crash_recovery`（replay 路径）：helper 写 `[header + 0901 rows + #COMMIT,0901,N + 0902 partial rows (no marker)]`，调 `ReplayEngine.run()` with snapshot 含 0901+0902 → 断言：最终 `#COMMIT` 数=2、0901 行数不变、0902 行数=预期、无空行无重复。模板：stale-fix `test_replay_fills_gap_without_corrupting_correct_rows`。
+- `test_e2e_live_restart_recovers_partial_minute`（**live restart 路径，M-R2-2**）：helper 写 `[header + 0901 rows + #COMMIT,0901,N + 0902 partial rows]` → 构造 `Engine`（mock feed 给 0902 snapshot/order）→ `Engine.start()` → 等 writer 处理 0902 → `Engine.stop()` → 断言：文件末行 `#COMMIT,0902,M`、0901 行数不变、0902 行数=预期、无重复无空行、`.truncated.*` 备份存在（若 truncate 发生）。**这是生产硬崩恢复的真实路径，必须闭环**。若 live feed mock 太重，退化为半闭环：`Engine.start()` 后立即 stop → 断言文件已 truncate + skip-set 已填（INV-CM-SKIPSET-LIVE）+ writer 未重生已 commit 分钟。
 
 **外部 consumer 兼容（C5）**：
 - `test_external_csv_reader_skips_hash_lines`：标准 csv.reader 解析含 `#COMMIT` 行的 tickfile，断言跳过/显式处理。

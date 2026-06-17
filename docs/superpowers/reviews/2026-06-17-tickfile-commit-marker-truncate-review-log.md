@@ -186,3 +186,121 @@
 ### 未采纳 / 延后问题
 * m1（marker 格式 extensibility）：Deferred — 当前格式足够，未来加 schema 版本再改；风险可接受（marker 解析已严格校验，格式演进时统一改 `_parse_commit_marker`）。
 * m4（consumer 校验工具）：Deferred — `validate_tickfile.py` 非必须；§8 风险表已提；后续按需开发。风险可接受（marker 是注释行，标准 CSV reader 按惯例跳 `#`）。
+
+---
+
+## Review Round 2
+
+### 审核时间
+* 2026-06-17 18:05:00
+
+### 本轮审核目标
+* 修改后复审；
+* 验证 Round 1 Critical/Major（C1-C7, M1-M6）是否落实；
+* 判断是否可进入 planning。
+
+### Round 1 问题处理状态复核
+
+| ID | Round 1 问题 | Round 1 决议 | 是否落实 | 证据/说明 |
+| -- | ---------- | ---------- | ---- | ----- |
+| C1 | tail-check 误判 marker | Accepted | ✅ | §5 `_is_legal_last_line`（Round 2 进一步收紧为复用 `_parse_commit_marker`，见 C-R2-1） |
+| C2 | recovery 时序+skip-set | Accepted | ✅ | §3.3 INV-CM-ORDER-1/2/SKIPSET-LIVE/LOCK；插入点 engine.py:377→381 经代码核实可实现 |
+| C3 | marker 合法性校验 | Accepted | ✅ | §3.2 `_parse_commit_marker` 4 规则 |
+| C4 | truncate 偏移+备份 | Accepted | ✅ | §3.2 INV-CM-LAST（保留 marker 作末行）+ INV-CM-BACKUP |
+| C5 | 回滚兼容 | Accepted | ✅ | §6 rollback playbook 3 步 + §8 风险表 |
+| C6 | E2E 测试缺失 | Accepted | ✅ | §7 `test_e2e_mid_append_crash_recovery`（Round 2 补 live restart 变体，见 M-R2-2） |
+| C7 | 崩溃表过度乐观 | Accepted | ✅ | §4 合并行 + INV-CM-MONO |
+| M1 | rows+marker 单次 fsync | Accepted | ✅ | §3.1 INV-CM-BATCH（Round 2 限定 append 路径，见 M-R2-3） |
+| M2 | 混存文件老分钟 | Accepted | ✅ | §3.2 committed_set ∪ row-only minutes + WARNING |
+| M3 | rowcount 语义 | Accepted | ✅ | §3.1 rowcount=len(rows) + §3.2 不一致 WARNING |
+| M4 | committed_set 来源+dup | Accepted | ✅ | §3.2 字节偏移最大 marker + dup/乱序 WARNING |
+| M5 | recovery 可观测性 | Accepted | ✅ | §3.2 结构化 log + 4 metric |
+| M6 | Status 改 review | Accepted | ✅ | header（Round 2 后改"Review 通过，可进入 planning"） |
+
+**结论**：Round 1 全部 13 条 Accepted 项（7 Critical + 6 Major）已落实。
+
+### Agent 原始复审摘要（简短）
+
+**Agent 1（恢复正确性复审）**：Round 1 全部闭环，commit-marker 语义三角（MONO/BATCH/LAST）+ recovery 准确性（committed_set 覆盖混存）+ 双路径时序均已写死，代码级核实插入点与变量定位成立。1 Major（M-R2-1：INV-CM-ORDER-1 未覆盖 cross-day writer resume 路径，经代码核实实际无风险——cross-day=新文件，建议补 INV）+ 3 Minor。结论：修改 Minor 后可以。
+
+**Agent 2（IO/锁/兼容复审）**：C1-C7/M1-M6 全部与现有源码一致（writer.py:31-35/338/407/414-421、engine.py:377/381/388、replay.py:74 核实）。0 Critical/0 Major + 3 Minor（澄清/边界/运维）。结论：可以进入 planning。
+
+**Agent 3（测试/上线复审）**：Round 1 决议逐条落实。但发现 **1 Critical（C-R2-1）**：§5 tail-check 谓词 `fields[0]=="#COMMIT"` 前缀匹配会把**截断 marker**（`#COMMIT,2026052809` 2 字段）误判合法 → 不补 `\n` → 数据行粘到截断 marker 后形成坏行；必须复用 `_parse_commit_marker` 严格校验。3 Major（M-R2-1 两 skip-set 字段、M-R2-2 live restart E2E 缺失、M-R2-3 fsync 测试仅 append 路径）。结论：必须先修 C-R2-1 + Majors。
+
+### 综合复审结论
+
+#### 已确认修复
+* Round 1 全部 C1-C7, M1-M6（13 条）落实（见复核表）。
+
+#### 仍需修改的问题（Round 2 新发现）
+
+**Critical**
+* **C-R2-1**（Agent 3）：§5 tail-check 谓词前缀匹配误判截断 marker。→ Accepted，已修（复用 `_parse_commit_marker`，§5 重写 + §7 加 `test_tail_check_truncated_marker_triggers_newline_fix`）。
+
+**Major**
+* **M-R2-1**（Agent 3）：replay `self._generated_tickfile_minutes`（replay.py:44）与 live `self._state._generated_tickfile_minutes`（aggregator.py:99）是两独立字段，INV-CM-SKIPSET 只点名 live。→ Accepted，已修（§3.3 拆 INV-CM-SKIPSET-LIVE / -REPLAY）。
+* **M-R2-1b**（Agent 1）：INV-CM-ORDER-1 未覆盖 cross-day `_tickfile_writer_resume` 路径（实际无风险，cross-day=新文件）。→ Accepted，已修（§3.3 加 INV-CM-ORDER-RESUME）。
+* **M-R2-2**（Agent 3）：E2E 只测 replay 路径，缺 live restart 端到端闭环（生产硬崩真实路径）。→ Accepted，已修（§7 加 `test_e2e_live_restart_recovers_partial_minute`）。
+* **M-R2-3**（Agent 3）：fsync 批次测试未区分 append vs atomic-create 路径。→ Accepted，已修（§3.1 INV-CM-BATCH 限定 append 路径 + atomic-create 由 tmp+rename 保证 + §7 测试明确 append 路径）。
+
+**Minor**（Deferred 到 plan 阶段）
+* m-R2-A1a（Agent 1）：truncate 点 vs committed_set 边界（marker 之后散落 row-only 行的极端混存）——spec §3.2 应明确"marker 之后 65 字段行视为 partial，truncate，不进 committed_set"。
+* m-R2-A1c（Agent 1）：`recover_tickfile_seqno` 跳 marker 行依赖未文档化（INV-CM-SEQNO-SKIP）。
+* m-R2-A2a（Agent 2）：INV-CM-ORDER-2 措辞（合并扫描 vs 串行）澄清。
+* m-R2-A2b（Agent 2）：rowcount=0 边界（空分钟是否写 marker）。
+* m-R2-A2c（Agent 2）：truncate 备份清理策略上限。
+* m-R2-A3a（Agent 3）：rollback playbook 缺"回滚后二次升级"路径。
+* m-R2-A3b（Agent 3）：metric `tickfile_recovery_invocations` 未区分 truncate/noop。
+
+### Round 2 修改决议
+
+| ID | 严重程度 | 问题 | 决议 | 状态 | 理由 |
+| -- | ---- | -- | ---- | ---- | --- |
+| C-R2-1 | Critical | tail-check 谓词误判截断 marker | 复用 `_parse_commit_marker` | Accepted（已修） | 谓词逻辑漏洞，运行时防线必须严格 |
+| M-R2-1 | Major | 两 skip-set 字段未分别约束 | 拆 SKIPSET-LIVE/REPLAY | Accepted（已修） | 防遗漏设字段 |
+| M-R2-1b | Major | cross-day resume 路径未声明 | 加 INV-CM-ORDER-RESUME | Accepted（已修） | 不变量补全（实际无风险） |
+| M-R2-2 | Major | live restart E2E 缺失 | 加 E2E 测试 | Accepted（已修） | 生产硬崩真实路径必须闭环 |
+| M-R2-3 | Major | fsync 测试路径未区分 | 限定 append + atomic 兜底 | Accepted（已修） | 测试期望准确 |
+| m-R2-* (7 条) | Minor | 澄清/边界/运维/可观测细节 | 推到 plan | Deferred | 非阻断，plan 阶段细化 |
+
+### Round 2 修改记录
+
+#### 修改文件
+* `docs/superpowers/specs/2026-06-17-tickfile-commit-marker-truncate-recovery-design.md`
+
+#### 修改章节
+* Header Status（Review 通过，可进入 planning）
+* §3.1 INV-CM-BATCH（M-R2-3：限定 append 路径 + atomic-create content 以 marker 结尾）
+* §3.3 INV-CM-SKIPSET-LIVE/REPLAY（M-R2-1）+ INV-CM-ORDER-RESUME（M-R2-1b）
+* §5 tail-check 谓词（C-R2-1：复用 `_parse_commit_marker`，非前缀匹配）
+* §7 测试（C-R2-1 `test_tail_check_truncated_marker_triggers_newline_fix`；M-R2-2 `test_e2e_live_restart_recovers_partial_minute`；M-R2-3 fsync 测试限定 append）
+
+#### 已解决问题
+* C-R2-1, M-R2-1, M-R2-1b, M-R2-2, M-R2-3（全部 Accepted，已落实于 spec）
+
+#### 未采纳 / 延后问题
+* 7 条 Minor（m-R2-*）：Deferred 到 plan 阶段。均为 spec 清晰性补强 / 边界澄清 / 运维文档 / 可观测细化，非生产正确性风险，不阻断 planning。后续跟进：plan 阶段逐条补，或实施时同步。
+
+### Round 2 结论
+**1. 可以进入 planning。**（C-R2-1 + 4 Major 已修复；剩余 7 Minor 全 Deferred 到 plan，非阻断。）
+
+---
+
+## 最终审核结论
+
+### 是否可以进入 planning
+**1. 可以进入 planning。**
+
+### 两轮审核摘要
+* **Round 1**：3 agents 发现 7 Critical（tail-check 误判 marker / recovery 时序 / marker 校验 / truncate 偏移+备份 / 回滚兼容 / E2E 缺失 / 崩溃表过度乐观）+ 6 Major（单次 fsync / 混存 / rowcount / committed_set / 可观测 / Status）+ 4 Minor。全部 Critical/Major Accepted 并修复。
+* **Round 2**：3 agents 复审确认 Round 1 全部落实；新发现 1 Critical（C-R2-1 tail-check 谓词前缀匹配误判截断 marker）+ 4 Major（两 skip-set 字段 / cross-day resume / live restart E2E / fsync 测试路径）。全部 Accepted 并修复。7 Minor Deferred 到 plan。
+
+### 已修改内容摘要
+* Spec 共修订：header Status ×2（review→通过）；§3.1（marker 写入 + INV-CM-MONO/BATCH）；§3.2（recovery 函数：marker 校验 + truncate 偏移/备份 + committed_set 来源 + log/metric + path）；§3.3（调用方 + 6 条 INV-CM-* 时序/skip-set/lock/resume）；§4（崩溃表合并 + 单调性）；§5（tail-check 谓词复用严格校验）；§6（向后兼容 + rollback playbook + 混存 + empty）；§7（测试补强：E2E 双路径 + 截断 marker + live restart + fsync 计数 + 混存 + 畸形 marker 等）；§8（风险表扩充）。
+
+### 仍需人工确认的问题
+* 7 条 Deferred Minor（见 Round 2 决议表 m-R2-*）：plan 阶段逐条补，或实施时同步——非阻断，但建议 plan 时 review。
+* **外部消费方 `#` 行兼容**（C5 残留）：需确认实际 tickfile 下游消费方是否跳 `#` 注释行；若不跳，回滚/正常运行期 marker 行可能解析失败。这是部署前的人工确认项。
+
+### Review log 文件路径
+* `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
