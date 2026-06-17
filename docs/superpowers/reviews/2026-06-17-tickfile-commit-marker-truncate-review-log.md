@@ -1,0 +1,188 @@
+# Tickfile Commit-Marker + Truncate 恢复设计 — Design Review Log
+
+> **Spec**: `docs/superpowers/specs/2026-06-17-tickfile-commit-marker-truncate-recovery-design.md`
+> **模式**: 2 轮 × 3 agents（崩溃恢复正确性 / IO-锁-兼容 / 测试-可观测-回滚）
+
+---
+
+## Review Round 1
+
+### 审核时间
+* 2026-06-17 17:10:00
+
+### 审核对象
+* `docs/superpowers/specs/2026-06-17-tickfile-commit-marker-truncate-recovery-design.md`
+
+### 本轮审核目标
+* 初审 commit-marker + truncate 方案；
+* 判断恢复正确性、IO/锁/兼容、测试覆盖风险；
+* 判断是否可进入 planning。
+
+### Agent 原始摘要（简短）
+
+**Agent 1（崩溃恢复正确性 + commit 语义）**：大方向正确（marker=commit point + truncate-to-last-commit 单调性）。但 §4 崩溃表对 rows/marker 可区分性过度乐观（kernel 按 page 刷回，不可靠区分，但恢复动作一致所以语义仍正确）；marker 合法性校验函数未定义（C2，截断/CRLF/坏字段会污染 committed_set）；truncate 无备份（C3，marker 校验 bug 误删完整分钟则无取证）；M3 tail-check 协同必须设计层闭环；M5 live 启动 recovery 时序未定义。
+
+**Agent 2（IO、锁、兼容、tail-check）**：2 Critical — tail-check 会误判 marker 行（len==3 !=65）每次 append 插多余 `\n` 污染文件（C1）；Engine live 启动 recovery 与 writer 线程启动顺序未定义（C2，TOCTOU 可能删 writer 刚写的合法行）。4 Major — seqno 恢复与 marker 恢复须协同（M1）；老新混存文件老分钟被当 gap 重生（M2）；truncate 偏移语义模糊（M3，须保留 marker 作末行）；rows+marker 须单次 fsync 批次（M4）。
+
+**Agent 3（测试、可观测、落地、回滚）**：2 Critical — 回滚兼容盲点（旧代码读新 marker 文件→旧 tail-check 注入空行，C1）；E2E mid-append crash recovery 测试缺失（C2，设计核心价值无端到端证明）。5 Major — 畸形 marker 防御（M1）；recovery 无 log/metric（M2）；live restart 路径未测（M3）；recovery 与 seqno 顺序未定义（M4）；Status 须改 review（M5）。
+
+### 综合问题清单（去重）
+
+#### Critical
+
+**C1 — tail-check 误判 marker 行触发错误 newline-fix（每次 append 插空行）**
+- 来源: Agent 2 C1, Agent 1 M3
+- 问题: 现有 `write_tickfile_rows` append 路径 tail-check（writer.py:407）用 `len(last_line.split(','))!=65` 判截断。加 marker 后健康文件末行是 `#COMMIT,...`（3 字段）→ 3!=65 → 每次正常 append 前插多余 `\n` → 文件累积空行，长期污染。
+- 影响: 文件空行污染；外部严格 CSV consumer 可能解析失败；reader 偏移漂移。
+- 修改决议: 修改 spec §5。
+- 状态: **Accepted**
+- 理由: 必现 bug，每次 append 触发。必须在 spec 写死 tail-check 合法末行谓词 = `(len==65) or startswith("#COMMIT,")`，不能推到 plan。
+
+**C2 — recovery 调用点时序 + skip-set 传播未定义（TOCTOU / 重复生成）**
+- 来源: Agent 2 C2, Agent 1 M5, Agent 3 M3/M4
+- 问题: spec §3.3 只说"Engine live 启动调同一函数"，未规定 recovery 必须在 `_tickfile_writer_thread.start()` **之前** + `recover_tickfile_seqno` **之前**；也未规定 recovery 返回的 committed_set 要写入 live 引擎的 `_generated_tickfile_minutes`（否则 writer 重生已 commit 分钟→重复）。
+- 影响: writer 线程已消费后 truncate 删合法行→丢数据；或重生已 commit 分钟→重复；seqno 取到被删分钟→倒退。
+- 修改决议: 修改 spec §3.3 加调用时序不变量。
+- 状态: **Accepted**
+- 理由: 生产数据正确性，TOCTOU + 重复/丢失。
+
+**C3 — marker 合法性校验未定义（malformed/truncated/dup/out-of-order/CRLF 污染）**
+- 来源: Agent 1 C2, Agent 3 M1, Agent 2 m4
+- 问题: spec §3.2 说"记录所有合法 marker"但未定义"合法"。截断 marker（`#COMMI,...`/`#COMMIT,093`）、坏字段、CRLF 残留（`4505\r`）、重复、乱序 minute 若进 committed_set → truncate 点错误或跳过未完整分钟。
+- 影响: 部分分钟误判 committed / truncate 点错误 / 跨日错位。
+- 修改决议: 修改 spec §3.2 定义 `_parse_commit_marker` 校验 + dup/out-of-order 处理。
+- 状态: **Accepted**
+- 理由: recovery 正确性核心。
+
+**C4 — truncate 偏移语义模糊 + 无备份（误删不可回溯）**
+- 来源: Agent 2 M3, Agent 1 C3, Agent 1 m2
+- 问题: §3.2"truncate 到该 marker 换行之后"措辞模糊（marker 自身换行 vs 前置换行？）。若删 marker→末行成数据行→下次 recovery 当无 marker→重生→重复。且无被 truncate tail 备份，marker 校验 bug 误删完整分钟则永久丢失无取证。
+- 影响: truncate 后重复 append / 数据丢失不可回溯。
+- 修改决议: 修改 spec §3.2：truncate 到 marker 自身换行之后（保留 marker 作末行）+ 备份被 truncate tail 到 `.truncated.{ts}`。
+- 状态: **Accepted**
+- 理由: 保留 marker 才保证下次 append 不重生；备份是低成本高价值取证。
+
+**C5 — 回滚安全性（旧代码读新 marker 文件）未覆盖**
+- 来源: Agent 3 C1
+- 问题: §6 只讲"新代码读老文件"，反向（回滚到旧代码读新 marker 文件）未覆盖。旧 tail-check 把 marker 当截断→插空行（与 C1 同源，但回滚方向无法改旧代码）。
+- 影响: 回滚后文件空行污染（reader 跳过不崩，但严格 CSV consumer 可能失败）。
+- 修改决议: 修改 spec §6 加 rollback playbook + §8 风险表列明。
+- 状态: **Accepted**
+- 理由: 上线回滚是真实场景，需显式文档化风险 + 清理手段。
+
+**C6 — E2E mid-append crash recovery 测试缺失（设计核心价值无证明）**
+- 来源: Agent 3 C2
+- 问题: §7 全是单测，无端到端闭环测试（crash→truncate→replay gap-fill→无重复无缺失）。stale-fix 已有 `test_replay_fills_gap_without_corrupting_correct_rows` 模板。
+- 影响: 设计成立性无证明，happy-path-only。
+- 修改决议: 修改 spec §7 加 `test_e2e_mid_append_crash_recovery`。
+- 状态: **Accepted**
+- 理由: 核心价值必须端到端证明。
+
+**C7 — §4 崩溃表对 rows/marker 可区分性过度乐观**
+- 来源: Agent 1 C1
+- 问题: kernel 按 page（4KB）刷回，"写 rows 中途"与"写 marker 中途"不可靠区分。恢复动作虽一致（都 truncate 到上个 marker，语义正确），但表格措辞误导实现者过度设计 mid-marker 检测。
+- 影响: 实现偏差（非正确性 bug，因恢复动作一致）。
+- 修改决议: 修改 spec §4 合并行 + 加单调性不变量。
+- 状态: **Accepted**
+- 理由: spec 清晰性，避免实现过度设计。
+
+#### Major
+
+**M1 — rows+marker 单次 fsync 批次不变量未写**
+- 来源: Agent 2 M4
+- 问题: §3.1 说"rows+marker 一起 append flush+fsync"但未禁止拆两次 write/fsync。若拆开→"rows 已 fsync 但 marker 未写"→该分钟完整数据无 marker→recovery 当 partial 删→重生重复。
+- 决议: Accepted。§3.1 加 INV：rows 与 marker 同一 open context 连续写 + 单次 flush+fsync。
+
+**M2 — 混存文件：老 row-only 分钟被当 gap 重生**
+- 来源: Agent 2 M2
+- 问题: 新代码首次 append 到老文件→文件=[老 row-only 分钟][新 marker 分钟]。recovery had_markers=True→committed_set 只含 marker 分钟→老分钟被 replay 当 gap 重生→重复。
+- 决议: Accepted。§3.2/§6：marker 模式下 committed_set ⊇ marker minutes ∪ marker 之前所有 65-字段行 minutes（或检测到混存时 warning + 纳入）。
+
+**M3 — rowcount 语义 + 不一致 warning 未定义**
+- 来源: Agent 1 M2
+- 问题: rowcount = `len(rows)`（实际写入）还是 `len(selected)`？未定义。bad rowcount 行为未定义。
+- 决议: Accepted。§3.1：rowcount=len(rows)（try/except 后存活数）；recovery rowcount≠实际行数→WARNING（不阻断）。
+
+**M4 — committed_set 来源 + dup/out-of-order marker 处理**
+- 来源: Agent 1 M1
+- 问题: truncate 点定义（字节偏移最大 marker vs minute_key 最大）；dup/乱序 marker 行为。
+- 决议: Accepted（与 C3 合并）。§3.2：truncate 点=字节偏移最大合法 marker；committed_set=所有合法 marker minute（set 去重）；dup/乱序→WARNING 不阻断。
+
+**M5 — recovery 可观测性（log/metric）缺失**
+- 来源: Agent 3 M2, Agent 1/2 建议
+- 问题: recovery 无 log/metric，运维无法回答"是否发生过崩溃恢复/truncate 了多少"。
+- 决议: Accepted。§3.2 加结构化 log（path/had_markers/committed_minutes/last_commit_minute/truncate_bytes）+ metric（tickfile_recovery_truncate_bytes 等）。
+
+**M6 — Status 字段须改 review 状态**
+- 来源: Agent 3 M5
+- 决议: Accepted。Status → "Review Round 1 通过，待 Round 2 复审"。
+
+#### Minor
+
+**m1 — marker 格式 extensibility（key=value）**
+- 来源: Agent 1 m1
+- 决议: **Deferred**。当前 `#COMMIT,<minute>,<count>` 足够；未来加 schema 版本再改。风险可接受。
+
+**m2 — recovery path 构造 note**
+- 来源: Agent 2 m3
+- 决议: Accepted。§3.2 补 path 构造（`get_tickfile_path(output_dir, f"{date}0000")`）。
+
+**m3 — 老文件 empty（只有 header 无数据无 marker）边界**
+- 来源: Agent 1 m4
+- 决议: Accepted。§6 明确：无数据行无 marker → had_markers=False（降级），committed_set 空，不 truncate。
+
+**m4 — 外部 consumer 校验工具**
+- 来源: Agent 2 m2
+- 决议: **Deferred**。`validate_tickfile.py` 校验 marker rowcount 非必须；§8 风险表提一句即可。后续按需。
+
+### Round 1 修改决议表
+
+| ID | 严重程度 | 问题 | 决议 | 状态 | 理由 |
+| -- | ------ | --- | ---- | ---- | --- |
+| C1 | Critical | tail-check 误判 marker 插空行 | 修改 spec §5 谓词 | Accepted | 必现 bug |
+| C2 | Critical | recovery 时序+skip-set 未定义 | 修改 spec §3.3 时序不变量 | Accepted | TOCTOU+重复/丢失 |
+| C3 | Critical | marker 合法性校验未定义 | 修改 spec §3.2 `_parse_commit_marker` | Accepted | recovery 正确性核心 |
+| C4 | Critical | truncate 偏移模糊+无备份 | 修改 spec §3.2 保留 marker+备份 | Accepted | 防重复+取证 |
+| C5 | Critical | 回滚兼容未覆盖 | 修改 spec §6 playbook+风险表 | Accepted | 上线回滚真实场景 |
+| C6 | Critical | E2E crash recovery 测试缺失 | 修改 spec §7 加 E2E 测试 | Accepted | 核心价值须证明 |
+| C7 | Critical | §4 崩溃表过度乐观 | 修改 spec §4 合并行+单调性 | Accepted | spec 清晰 |
+| M1 | Major | rows+marker 单次 fsync | 修改 spec §3.1 INV | Accepted | 防重复 |
+| M2 | Major | 混存文件老分钟被当 gap | 修改 spec §3.2/§6 | Accepted | 防 replay 重复 |
+| M3 | Major | rowcount 语义+不一致 warning | 修改 spec §3.1 | Accepted | 诊断 |
+| M4 | Major | committed_set 来源+dup/乱序 | 合并入 C3 §3.2 | Accepted | 正确性 |
+| M5 | Major | recovery 可观测性 | 修改 spec §3.2 log+metric | Accepted | 生产可观测 |
+| M6 | Major | Status 改 review | 修改 header | Accepted | 流程 |
+| m1 | Minor | marker 格式 extensibility | 延后 | Deferred | 风险可接受 |
+| m2 | Minor | recovery path 构造 | 补 §3.2 | Accepted | 清晰 |
+| m3 | Minor | 老文件 empty 边界 | 补 §6 | Accepted | 清晰 |
+| m4 | Minor | consumer 校验工具 | 延后 | Deferred | 非必须 |
+
+### Round 1 结论
+**3. 需要修改后进行 Round 2 复审。**（7 Critical + 6 Major Accepted，必须在 spec 闭环后才能 Round 2。）
+
+---
+
+## Round 1 修改记录
+
+### 修改文件
+* `docs/superpowers/specs/2026-06-17-tickfile-commit-marker-truncate-recovery-design.md`
+
+### 修改章节
+* Header Status（M6）
+* §3.1 marker 写入（M1 fsync 批次 INV + M3 rowcount 语义）
+* §3.2 恢复函数（C3 marker 校验 + C4 偏移+备份 + M4 committed_set 来源 + M5 log/metric + m2 path 构造）
+* §3.3 调用方（C2 时序不变量）
+* §4 崩溃场景（C7 合并行+单调性）
+* §5 tail-check 协同（C1 谓词）
+* §6 向后兼容（C5 rollback + M2 混存 + m3 empty）
+* §7 测试（C6 E2E）
+
+### 修改摘要
+（见下方实际 spec 编辑后的 diff；逐条对应 C1–C7, M1–M6, m2, m3）
+
+### 已解决问题
+* C1–C7, M1–M6, m2, m3（全部 Accepted 落实于 spec）
+
+### 未采纳 / 延后问题
+* m1（marker 格式 extensibility）：Deferred — 当前格式足够，未来加 schema 版本再改；风险可接受（marker 解析已严格校验，格式演进时统一改 `_parse_commit_marker`）。
+* m4（consumer 校验工具）：Deferred — `validate_tickfile.py` 非必须；§8 风险表已提；后续按需开发。风险可接受（marker 是注释行，标准 CSV reader 按惯例跳 `#`）。
