@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 12 轮 review 完成（6 组 × 2 轮），sidecar + fcntl.flock 方案可进入 planning。
+> **Status**: 13 轮 review（+跨输出一致性/sidecar 篡改/spec 可读性），待 Round 14 复审。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -224,6 +224,32 @@ POSIX 唯一的原子文件操作是 `rename`（整个文件替换）；**没有
 - metrics 是进程内（内存 int），硬崩溃丢失。**唯一持久信号 = audit log**（`tickfile_recovery.log` JSON-lines）。
 - 最小告警查询（运维 runbook）：`tail -F tickfile_recovery.log | jq 'select(.result=="error" or .truncate_bytes>0 or .had_sidecar==false)'`。
 - `tickfile_writer_perm_dead`（M-R5-7）须路由到 `logger.critical`（→ rotated `errors.log`），不能仅存内存 metric（硬崩溃前 writer 已死 → 无 CHECK 路径 → 运维看不到）。
+
+### 3.8 Round 13 跨输出一致性 + sidecar 篡改防护 + spec 可读性（系统级增补）
+
+> 前 12 轮聚焦 tickfile 自身 sidecar/flock/recovery 正确性；Round 13 首次从**系统级**角度审查——tickfile 与 order/snapshot 的跨输出一致性 + sidecar 外部篡改 + spec 对新实现者的可操作性。
+
+**C-R13-1 — 跨输出分歧：order/snapshot 存在但 tickfile 被 truncate → 永久缺失**
+- **场景**：crash 在 snapshot/order flush（per-minute rename 成功）后、tickfile sidecar 写入前 → recovery truncate 掉 tickfile 该分钟。重启后：`flushed_snapshot_minutes` / `_flushed_order_minutes` 含该分钟（从文件重建）→ snapshot/order 路径不重生成 → tickfile 永久缺。**INV-CM-CHECKPOINT-RECONCILE 只对账 snapshot↔tickfile，不含 order。**
+- **INV-CM-RECONCILE-THREE-WAY（扩展 C-R9-1）**：recovery 完成后，对账**三路**：
+  - `tickfile_missing = (output_minutes ∪ _flushed_order_minutes) − committed_set`（snapshot/order 有、tickfile 缺）→ CRITICAL + **从 order/snapshot 分钟文件重建 tickfile 行**（读 `order_minute_*` + `snapshot_minute_*` → `select_tickfile_records` → `write_tickfile_rows` + sidecar append）。
+  - `tickfile_only = committed_set − (output_minutes ∪ _flushed_order_minutes)`（tickfile 有、snapshot/order 缺）→ CRITICAL + 从 tickfile 行**反向重建** snapshot/order 文件（tickfile 65 字段含足够信息），或 FAIL FAST 停止下游消费。
+  - **INV-CM-RECONCILE-ORDER**：对账在 (a) tickfile recovery 返回 committed_set + (b) checkpoint `output_minutes` 加载 + (c) `_flushed_order_minutes` 从文件重建——三者都完成后运行。engine 启动中的时序点：`_restore_from_checkpoint`（加载 output_minutes + recover_flushed_minutes）→ flusher `__init__` recovery（committed_set）→ 对账。
+
+**C-R13-2 — sidecar 外部截断/误清 → live engine 无 _scan fallback → 全量重生百万行重复**
+- **场景**：运维操作（backup/rsync/logrotate/echo "" > sidecar）误截断 sidecar → `had_sidecar=False`。**replay 降级走 `_scan` 重建 skip-set（stale-fix 有）；但 live engine 的 `had_sidecar=False` 降级路径未定义 _scan fallback**（INV-CM-SKIPSET-LIVE 只说 committed_set 写入，committed_set=None 时 live 的 `_generated_tickfile_minutes` 是空集？→ live 认为全部分钟是 gap → 全量重生 → 百万行重复）。**spec 自身的 recovery 机制成为破坏源。**
+- **INV-CM-SKIPSET-LIVE-FALLBACK**：live engine `had_sidecar=False` 时，**也必须**像 replay 一样运行 `_extract_minutes_from_tickfile` 填充 `_state._generated_tickfile_minutes`（不依赖 sidecar，从 tickfile 数据行 UpdateTime 列重建）。与 replay 降级路径对称。记 WARNING `live_skipset_reconstructed_from_rows`。
+- **INV-CM-SIDECAR-TAMPER-DETECT**：recovery 时若 `had_sidecar=False` 但 tickfile 非平凡（size >> header），对比 audit log 上次记录的 `committed_count`——若上次 >0 而本次 sidecar 空 → CRITICAL `sidecar_tamper_detected` + 从 tickfile 行重建 sidecar（scan UpdateTime → 每分钟 offset → 写 sidecar 行）。
+- 测试：`test_sidecar_truncated_live_rebuilds_skipset_from_rows`、`test_sidecar_tamper_detected_from_audit_log`、`test_reconcile_three_way_order_snapshot_tickfile`。
+
+**Mj-R13-1 — INV 总表（实现者完成 checklist）**
+- plan Task 0 须在 §3 开头加 INV 总表：`| ID | 一句话 | 所在小节 | 状态（active/deprecated/superseded-by-X） | 对应测试 |`。~55 条 INV 散布 §3.1-3.8 + §4 + §5，当前无法逐条 verify。过时 INV（INV-CM-BATCH 被 ORDERED-TWO-FILE 取代、INV-CM-LAST 被 OFFSET-MAX 取代）须标 `superseded`。
+
+**Mj-R13-2 — §3 版本地图（新读者导航）**
+- §3 开头加："§3.1/3.2 = sidecar 终版（覆盖所有前序 in-file 描述）；§3.4-3.8 = 增补，冲突时以 §3.1/3.2 为准。"
+
+**Mj-R13-3 — 调用点接缝表**
+- §3.3 加：`| 调用点 | 调用语句 | 写入字段 | had_sidecar=False 分支 |`，覆盖 flusher __init__ / replay run / health-check restart / cross-day resume（N/A）。
 
 ## 4. 崩溃场景全覆盖（C7 修订：不依赖 rows/marker 精确区分）
 
