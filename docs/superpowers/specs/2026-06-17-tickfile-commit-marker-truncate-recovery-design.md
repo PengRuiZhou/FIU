@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ Review 通过（Round 1: 7C+6M；Round 2: 1C+4M 全修复），可进入 planning
+> **Status**: ✅ Review 通过（Round 1: 7C+6M；Round 2: 1C+4M；Round 3: 3C+10M；Round 4: 2M 全修复），可进入 planning
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -118,7 +118,7 @@ metric（接入 engine 现有 `_tickfile_*` 计数器家族）：`tickfile_recov
 - **INV-CM-SKIPSET-REPLAY**：replay 路径写入 ReplayEngine 自身的 `self._generated_tickfile_minutes`（replay.py 字段，**与 live 的 SharedState 字段是两个独立字段**）。两条路径各自必须设对应字段。
 - **INV-CM-LOCK**：recovery 的 truncate 持 `_get_write_lock(path)`；writer 线程也持同一 lock → 互斥安全（且因 INV-CM-ORDER-1 时序，实际无并发）。
 - **INV-CM-ORDER-RESUME**（cross-day resume）：`_tickfile_writer_resume()`（cross-day reset 后重建 writer 线程）**无需**调 recovery——因 cross-day 已 `_generated_tickfile_minutes.clear()` 且目标为**新 date 的 fresh 文件**（不存在/仅 header，无 partial）。若未来引入 same-day resume（同 date 文件续写），必须在该路径补 recovery + 时序同 INV-CM-ORDER-1。
-- **INV-CM-ORDER-2**（扩展，M-R3-1）：recovery 必须严格早于**所有** seqno 读取入口——含 `ClockWatermarkFlusher.__init__` 的 `recover_tickfile_seqno_lazy`（engine 构造时即取）+ `start()` 的 `_recover_tickfile_seqno`。推荐：移除 `__init__` 的 lazy seqno 调用或改为 recovery 之后延迟，让 recovery 成为唯一首步。
+- **INV-CM-ORDER-2**（扩展，M-R3-1 + M-R4-1b）：recovery 必须严格早于**所有** seqno 读取入口——含 `ClockWatermarkFlusher.__init__` 的 `recover_tickfile_seqno_lazy`（engine 构造时即取）+ `start()` 的 `_recover_tickfile_seqno` + **replay `_flush_snapshot_minute` 的 lazy seqno**（replay.py，第三入口）。推荐：recovery 返回的 `last_seqno` 直接覆盖 `self._tickfile_seqno`（消除三个 lazy 入口，recovery 成唯一首步）——最干净。
 
 ### 3.4 运行时正确性 / 失败安全 / 并发（Round 3 增补）
 
@@ -126,7 +126,11 @@ metric（接入 engine 现有 `_tickfile_*` 计数器家族）：`tickfile_recov
 
 **C-R3-1 — writer 线程 retry / health-check 重启 / resume 路径须自愈（防重生重复）**
 - **场景**：`_try_generate_tickfile` 在 rows 写后、marker/fsync 前**抛 IOError**（disk-full，生产高频）→ except 块 re-insert pending → writer loop retry → **append 到已含 partial rows 的文件 → 重复行**。`_tickfile_writer_health_check`（engine.py:1458）自动重启 writer 同样无 recovery。
-- **INV-CM-REGEN-GUARD**：`_try_generate_tickfile` append 路径的 **precondition = 文件末尾为合法 marker**（首分钟除外）。append 前若检测到末尾非法（partial rows / 截断 marker）→ 先 truncate 到最后合法 marker（复用 `_recover_tickfile_to_last_commit` 或其轻量子集），再 append。使**每次 append 自愈**，不只启动。
+- **INV-CM-REGEN-GUARD**：`_try_generate_tickfile` append 路径的 **precondition 携带 `current_minute_key`**，分支处理（首分钟除外）：
+  1. 末尾**非法**（partial rows / 截断 marker）→ truncate 到最后合法 marker → 正常 append 当前分钟。
+  2. 末尾**合法 marker 且其 minute == `current_minute_key`**（**M-R4-1a**：marker 已写、fsync 失败的 retry 场景）→ **视为已提交**：**skip append** + 把 `current_minute_key` 加入 `_generated_tickfile_minutes`（防再次 re-insert/retry 重复）。不重写。
+  3. 末尾**合法 marker 且其 minute < `current_minute_key`**（前一分钟正常 commit）→ 正常 append 当前分钟。
+  - 谓词复用同一 `_parse_commit_marker`（不做"轻量子集"，避免第二套解析标准漂移）。使**每次 append 自愈**，覆盖 fsync 失败 retry（disk-full 高频），不只启动。
 - **INV-CM-ORDER-RESTART**：`_tickfile_writer_health_check` 与 same-day `_tickfile_writer_resume` 重启 writer 线程前，必须先调 `_recover_tickfile_to_last_commit`（同 INV-CM-ORDER-1 语义）。
 - 测试：`test_writer_ioerror_retry_truncates_partial_no_duplicate`（mock write 中途抛 IOError + 已写 partial rows → re-insert → retry → 文件无重复 + 末行合法 marker）、`test_writer_health_check_calls_recovery_before_restart`。
 
@@ -250,6 +254,7 @@ def _is_legal_last_line(line):
 
 **Writer retry / health-check / 跨进程（Round 3）**：
 - `test_writer_ioerror_retry_truncates_partial_no_duplicate`（C-R3-1）：write 中途 IOError + partial rows → re-insert → retry → 无重复 + 末行合法 marker。
+- `test_writer_ioerror_after_marker_write_no_duplicate`（**M-R4-1a**）：rows+marker 已写（page cache），`os.fsync` 抛 IOError → re-insert → retry → precondition 见末尾合法 marker 且 minute==current → **skip append + 标 committed** → 无重复。
 - `test_writer_health_check_calls_recovery_before_restart`（C-R3-1）：writer 死亡 → health_check → recovery 被调 + skip-set 同步。
 - `test_replay_rejects_concurrent_live_date`（C-R3-3）：pidfile 占用 → replay abort。
 - `test_recovery_returns_seqno_from_committed_only`（M-R3-4）：partial 行 seqno 不进返回值。

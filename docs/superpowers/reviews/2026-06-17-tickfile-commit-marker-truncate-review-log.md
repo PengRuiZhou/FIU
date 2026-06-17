@@ -418,3 +418,92 @@
 
 ### Round 3 结论
 **3. 需要修改后进行 Round 4 复审。**（3 Critical + 10 Major Accepted。前两轮聚焦静态/启动正确性，Round 3 揭示动态运行时正确性（writer retry）、recovery 自身失败安全、跨进程并发三大类生产风险，必须 spec 闭环。）
+
+---
+
+## Review Round 4（Round 3 修复后复审）
+
+### 审核时间
+* 2026-06-17 19:50:00
+
+### 本轮审核目标
+* 验证 Round 3 Critical/Major（C-R3-1/2/3, M-R3-1..10）是否落实；
+* 找仍存风险；判断是否可进入 planning。
+
+### Round 3 问题处理状态复核
+
+| ID | Round 3 问题 | 决议 | 是否落实 | 证据 |
+| -- | ---------- | ---- | ---- | --- |
+| C-R3-1 | writer retry/restart 无 recovery → 重复 | Accepted | ✅ | §3.4 INV-CM-REGEN-GUARD（本轮 M-R4-1a 补全 fsync-fail 子情形）+ ORDER-RESTART |
+| C-R3-2 | recovery 非 fail-atomic | Accepted | ✅ | §3.4 INV-CM-FAIL-ATOMIC |
+| C-R3-3 | 跨进程 RLock 不互斥 | Accepted | ✅ | §3.4 INV-CM-SINGLEPROC + replay guard |
+| M-R3-1 | seqno 双入口 | Accepted | ✅ | §3.3 INV-CM-ORDER-2 扩展（本轮 M-R4-1b 补 replay 第三入口） |
+| M-R3-2 | cleanup .tmp 无 marker+顺序 | Accepted | ✅ | §3.4 INV-CM-CLEANUP-ORDER |
+| M-R3-3 | 备份碰撞+IO 失败 | Accepted | ✅ | §3.2 time_ns+pid + 失败 abort |
+| M-R3-4 | seqno 与 truncate 合并 | Accepted | ✅ | §3.2 recovery 返回 3-tuple |
+| M-R3-5 | committed_set 未 date 过滤 | Accepted | ✅ | §3.2 INV-CM-DATE-FILTER |
+| M-R3-6 | rollback 源数据窗口 | Accepted | ✅ | §6 playbook Step 0 |
+| M-R3-7 | 测试无 fault-injection | Accepted | ✅ | §7 四条 fault-injection 测试 |
+| M-R3-8 | metric 不跨崩溃 | Accepted | ✅ | §3.4 持久 audit log |
+| M-R3-9 | retry carry-forward 漂移 | Accepted | ✅ | §8 风险表 |
+| M-R3-10 | atomic-create 跨进程 | Accepted | ✅ | fold 入 SINGLEPROC |
+
+**结论**：Round 3 全部 3 Critical + 10 Major 已落实。
+
+### Agent 原始复审摘要（简短）
+
+**Agent 1（正确性）**：Round 3 全部闭环（源码级核实重试路径真实存在、precondition 落在 `_get_write_lock` 内 TOCTOU 安全）。1 Major（M-R4-1a：REGEN-GUARD precondition 未覆盖"marker 已写、fsync 失败"retry → 末尾合法 marker → 不 truncate → 重 append → 重复完整分钟）。结论：修改后可以。
+
+**Agent 2（IO/并发）**：6 项重点确认全部闭环（SINGLEPROC、3-tuple seqno 合并、CLEANUP-ORDER、备份 time_ns+pid+abort、FAIL-ATOMIC 锁范围）。1 Major（M-R4-1b：replay lazy seqno 第三入口 replay.py:311 未在 INV-CM-ORDER-2，当前无 bug 但 INV 网不全；建议 recovery 返回值覆盖消除入口）。结论：修改后可以。
+
+**Agent 3（测试/运维）**：Round 3 全部 Major 落实且源码核实可实现。0 Critical/0 Major。5 Minor（audit log 轮转/IO 失败语义、live feed mock seam、性能 note、deferred 清单）。结论：可以进入 planning。
+
+### 综合复审结论
+
+#### 已确认修复
+* Round 3 全部 3C+10M（见复核表）。
+
+#### 仍需修改的问题（Round 4 新发现，已修）
+
+**Major**
+* **M-R4-1a**（Agent 1）：C-R3-1 自愈 precondition 漏"marker 已写、fsync 失败"retry → 重复。→ Accepted，已修（§3.4 INV-CM-REGEN-GUARD precondition 带 `current_minute_key`，三分支：末尾非法→truncate+append；末尾合法 marker==current→skip+committed；末尾合法 marker<current→append）+ §7 `test_writer_ioerror_after_marker_write_no_duplicate`。
+* **M-R4-1b**（Agent 2）：replay lazy seqno 第三入口未在 INV-CM-ORDER-2。→ Accepted，已修（§3.3 INV-CM-ORDER-2 补 replay lazy 入口；推荐 recovery 返回 last_seqno 覆盖消除三入口）。
+
+**Minor**（Deferred 到 plan，共 ~7 条）
+* audit log 轮转/上限、audit log IO 失败语义（best-effort 不阻断）、live feed mock seam（plan 需加 test-only 注入点）、INV-CM-REGEN-GUARD 性能 note（增量=1 次 marker 解析，可忽略）、Round 2/3 deferred 的 12 条 Minor 逐条 review（尤其 m-R2-A1a：marker 之后 row-only 行视为 partial truncate，不进 committed_set——建议 plan Task 0 明确）。
+
+### Round 4 修改决议
+
+| ID | 严重程度 | 问题 | 决议 | 状态 |
+| -- | ---- | -- | ---- | ---- |
+| M-R4-1a | Major | REGEN-GUARD 漏 fsync-fail retry 重复 | precondition 三分支 | Accepted（已修） |
+| M-R4-1b | Major | replay lazy seqno 第三入口 | INV-CM-ORDER-2 补 + 消除入口 | Accepted（已修） |
+| m-R4-* (7) | Minor | 轮转/seam/note/deferred 清单 | 推 plan | Deferred |
+
+### Round 4 结论
+**1. 可以进入 planning。**（Round 3 全部 3C+10M 落实；Round 4 新发现 2 Major 已修；剩余 ~7 Minor 全 Deferred 到 plan，非阻断。）
+
+---
+
+## 最终审核结论（4 轮后）
+
+### 是否可以进入 planning
+**1. 可以进入 planning。** ✅
+
+### 四轮审核摘要
+* **Round 1**：7 Critical + 6 Major + 4 Minor（静态/启动正确性：tail-check 谓词、recovery 时序、marker 校验、truncate 偏移/备份、回滚、E2E、崩溃表）→ 全修。
+* **Round 2**：确认 Round 1 落实；1 Critical（C-R2-1 tail-check 前缀匹配误判截断 marker）+ 4 Major → 全修。
+* **Round 3**（对抗性深度）：3 Critical（writer retry 自愈、recovery fail-atomic、跨进程）+ 10 Major（seqno 三入口、cleanup、备份碰撞、audit log、date 过滤、rollback 源窗口、fault-injection 测试…）→ 全修。
+* **Round 4**：确认 Round 3 落实；2 Major（M-R4-1a fsync-fail retry 自愈漏洞、M-R4-1b replay lazy seqno 第三入口）→ 全修。7 Minor Deferred。
+
+### 已修改内容摘要
+spec 经 4 轮共修：§3.1（marker 写入 + INV-CM-MONO/BATCH）、§3.2（recovery：`_parse_commit_marker` 严格校验 + truncate 保留 marker + 备份 time_ns+pid+IO-fail-abort + 3-tuple 返回含 last_seqno + committed_set 来源（marker∪row-only，date 过滤）+ log/metric/audit log + fail-atomic）、§3.3（调用方 + INV-CM-ORDER-1/2(三 seqno 入口)/SKIPSET-LIVE/REPLAY/LOCK/ORDER-RESUME）、§3.4（运行时正确性：INV-CM-REGEN-GUARD(三分支) + ORDER-RESTART + FAIL-ATOMIC + SINGLEPROC + CLEANUP-ORDER）、§4（崩溃表合并+单调性）、§5（tail-check 复用 `_parse_commit_marker`）、§6（向后兼容 + rollback Step 0 源验证 + 混存 + empty）、§7（fault-injection + writer retry/health-check/跨进程 + live restart 强制 E2E + ~25 测试）、§8（风险表扩充）。
+
+### 仍需人工确认的问题
+1. **~12 条 Deferred Minor**（Round 2/3/4）：plan Task 0 逐条 review，尤其 **m-R2-A1a**（marker 之后 row-only 行视为 partial truncate，不进 committed_set）须实现前明确。
+2. **外部消费方 `#` 行兼容**（C5 残留）：部署前确认下游跳 `#` 注释行。
+3. **live feed mock seam**（Round 4 Minor）：`test_e2e_live_restart_recovers_partial_minute` 强制 E2E 需 Engine 有 test-only feed 注入点；plan 阶段确认或补。
+4. **多进程部署**（C-R3-3）：若真实场景需 live+replay 并发，OS 建议锁（`fcntl.flock`/`msvcrt.locking`）为 future，当前依赖 INV-CM-SINGLEPROC + replay guard。
+
+### Review log 文件路径
+* `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
