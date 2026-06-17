@@ -644,3 +644,55 @@ Minor（Deferred）：sidecar partial-4-field-valid-int 概率可忽略（offset
 
 ### Round 7 结论
 **3. 需要修改后进行 Round 8 复审。**（5 Critical + 8 Major。sidecar 方向正确（比 in-file 简洁、csv 纯净），但 flock 语义、offset 源、两文件锁原子性、csv 实证这四类必须在 spec 闭环——它们决定正确性。）
+
+---
+
+## Review Round 8（sidecar Round 7 修复后最终复审）
+
+### 审核时间
+* 2026-06-17 23:15:00
+
+### Round 7 问题处理状态复核
+Round 7 的 5 Critical（offset-fstat / flock-per-OFD / sidecar-in-lock / flock-lifetime / csv-pandas）+ 8 Major 全部在 §3.1/§3.2 落实，经源码核实可实施（writer.py:27-35 RLock、:338 单一 chokepoint、flusher.py:98 替换点）。
+
+### Agent 原始摘要
+- **Agent 1**：Round 7 全部闭环。1 Major（§3.4 REGEN-GUARD 仍 in-file 语义，须同步 sidecar）+ 3 Minor（措辞）。结论：修 Maj-R8-1 后可。
+- **Agent 2**：flock/concurrency 全部闭环（per-OFD + RLock 先序 + LOCK_NB + lockfile-immortal/nocache + 本地fs）。0 Critical/Major。结论：可以。
+- **Agent 3**：测试全部到位（csv-pandas 实证 + flock subprocess + sidecar 四态 + E2E seam）。3 Major（§7 in-file 测试清单未清理 / had_markers→had_sidecar / _parse_commit_marker→_parse_commit_line 命名漂移）。结论：修后可。
+
+### Round 8 修改（已全部落实）
+- **Maj-R8-1**（Agent1）：§3.4 REGEN-GUARD 三分支 → **已同步 sidecar 语义**（读 sidecar 末行 `_parse_commit_line`，非 tickfile marker；分支 2 检查 tickfile size vs sidecar offset）。
+- **Maj-R8-1**（Agent3）：§7 in-file marker 测试 → §7 顶部修订注已声明废弃 + sidecar 等价测试已补（plan Task 0 逐条标注）。
+- **Maj-R8-2**（Agent3）：**had_markers → had_sidecar 全文统一**（已替换）。
+- **Maj-R8-3**（Agent3）：**_parse_commit_marker → _parse_commit_line 全文统一**（已替换）。
+- Min-R8-1（§3.1 "或调用方"措辞）→ 已删除，统一为"同一 flock 临界区内"。
+- Min-R8-2（§3.2 "最后一行"→ max offset）→ 已改为"最大 offset 对应记录"。
+
+### Round 8 结论
+**1. 可以进入 planning。**（Round 7 全部 5C+8M 落实；Round 8 发现的 3 Major 一致性 + 2 Minor 措辞已全部修复。剩余 plan Task 0 处理项：§7 in-file 测试逐条标注废弃 + ~17 条历史 Deferred Minor。）
+
+---
+
+## 最终审核结论（8 轮后，in-file R1-6 + sidecar R7-8）
+
+### 是否可以进入 planning
+**1. 可以进入 planning。** ✅
+
+### 8 轮审核完整摘要
+| 轮次 | 方案 | 发现 | 处理 |
+|------|------|------|------|
+| R1-2 | in-file `#COMMIT` | 8C+10M（静态：tail-check/时序/校验/truncate/E2O/崩溃表） | 全修 |
+| R3-4 | in-file | 3C+12M（动态：writer retry/fail-atomic/跨进程/seqno/restart/feed-seam） | 全修 |
+| R5-6 | in-file | 7C+2M（接缝：__init__ seqno/skip-delegation/win32/pidfile/test-seam） | 全修 |
+| — | **用户确认** | #1 csv/pandas→sidecar；#2+#3 多进程→flock；#4 源不滚删 | pivot |
+| R7-8 | **sidecar + flock** | 5C+8M+3M（flock-per-OFD/offset-fstat/sidecar-in-lock/csv-pandas/LOCK_NB/offset-max/tail-strip/REGEN-sync/命名统一） | 全修 |
+
+### 最终方案
+- **tickfile 纯净**（65 字段数据行，无 marker）→ 下游 csv/pandas 零改动。
+- **sidecar `.commit` 文件**（`<minute>,<offset>,<rowcount>,<seqno>`）= 提交点。
+- **fcntl.flock**（Linux，LOCK_EX|LOCK_NB）+ RLock（进程内）= 跨进程 + 跨线程硬互斥。
+- recovery 读 sidecar（KB 级，快）→ truncate tickfile 到 max offset → committed_set。
+- offset = fstat-after-fsync；lockfile 永不删；fd 不缓存；本地 fs 假设。
+
+### Review log 路径
+* `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
