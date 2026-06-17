@@ -520,6 +520,12 @@ class ClockWatermarkFlusher:
                 else:
                     skipped_keys.append(mk)
             if skipped_keys:
+                # Remove skipped from pending so the engine's post-flush CHECK does not
+                # flag them as failures; they are intentionally deferred to replay as
+                # 'missing' (mirrors the cross-day path). Spec §3.1.
+                with self._state.lock:
+                    for mk in skipped_keys:
+                        self._state._tickfile_pending.pop(mk, None)
                 logger.warning(
                     "Shutdown skipped %d tickfile minutes order hadn't reached "
                     "(no stale rows written; fill via ReplayEngine --date=%s): %s",

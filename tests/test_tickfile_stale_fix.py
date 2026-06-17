@@ -49,6 +49,9 @@ class TestShutdownSkipsUnreachedMinutes:
         called = [c.args[0] for c in mock_gen.call_args_list]
         assert "202605281429" in called          # reached -> generated
         assert "202605281500" not in called       # unreached -> skipped
+        # Skipped minutes must be removed from _tickfile_pending so the engine's
+        # post-flush CHECK 1 does not flag them as failures (deferred to replay, not failed).
+        assert "202605281500" not in state._tickfile_pending
 
     def test_natural_eof_generates_last_minute(self, tmp_path):
         """order_current_minute == last pending minute must still generate it (>= not >)."""
