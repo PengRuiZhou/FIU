@@ -927,3 +927,38 @@ Minor：§4/§5/§6/§9 措辞残留 in-file（Mj-R13-2 配套）、lockfile 路
 
 ### Review log
 * `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
+
+---
+
+## Review Round 15（全新角度：故障传播链 / plan 可操作性 / 极端边界）
+
+### 审核时间
+* 2026-06-18 04:30:00
+
+### 综合问题清单
+
+#### Critical
+| ID | 来源 | 问题 | 决议 |
+| -- | ---- | ---- | ---- |
+| C-R15-1 | A1 | **disk-full + REGEN-GUARD 分支 1/2 死区**：sidecar 未 fsync 时末行仍=N-1（走分支 1），但 spec 场景描述把它归入分支 2（==）→ 自相矛盾 → 分支 1 不检测 tickfile 已含 N rows → 重复 append → 逐分钟 cascade | Accepted — §3.9 修正 REGEN-GUARD 分支定义为 (sidecar末行, tickfile_size vs offset) 二元组四分支 |
+| C-R15-2 | A3 | **跨天 pause 未栅栏旧日 sidecar**：cross-day `_tickfile_writer_pause` join 后未对旧日 recovery → 旧日 sidecar 可能缺末分钟 → 但状态已 clear → 旧日停在不一致状态 | Accepted — §3.9 INV-CM-CROSSDAY-FLUSH-BARRIER |
+| C-R15-3 | A3 | **sidecar 篡改检测无 audit log 时失效**（首次部署后 sidecar 被截断，audit log 不存在）→ tamper 静默 → 全量重生百万行 | Accepted — §3.9 INV-CM-TAMPER-HEURISTIC-TICKFILE-NONTRIVIAL |
+| C-OP-1 | A2 | **§7 31条 [DEPRECATED] 未重写**（第5次发现，R9/R10/R12/R13/R15）— plan 作者照写会全错 | 已接受（recurring，deferred plan Task 0，不重开） |
+| C-OP-2 | A2 | **§M-R3-2 "末行合法 marker" 与 §5 "tickfile 无 marker" 矛盾** | Accepted — §3.9 修正 M-R3-2 为"末行合法 65-field 数据行" |
+
+#### Major
+| ID | 来源 | 问题 | 决议 |
+| -- | ---- | ---- | ---- |
+| M-R15-1 | A1 | flock fd 异常路径泄漏 → retry 自锁 → writer 永久死亡 | Accepted — §3.9 INV-CM-FLOCK-FINALLY |
+| M-R15-2 | A1 | NFS 误配无运行时检测（部署假设仅文档） | Accepted — §3.9 INV-CM-FS-CHECK-RUNTIME |
+| M-R15-3 | A1 | audit+sidecar 同清 → tamper 检测失效（checkpoint 交叉验证） | Accepted — §3.9 INV-CM-TAMPER-MULTI-BASIS |
+| M-R15-4 | A3 | replay 幂等二次跑静默无操作 → 应 INFO 可观测 | Accepted — §3.9 note |
+| M-R15-5 | A3 | 午休 60 分钟无 sidecar 行 → 应文档化"正常" | Accepted — §3.9 INV-CM-SESSION-GAP-OK |
+| M-R15-6 | A3 | lockfile 截断/替换（非删除）也致 inode 竞争 | Accepted — §3.9 扩展 LOCKFILE-IMMORTAL |
+| M-R15-7 | A3 | sidecar 无 size 上限 → 外部垃圾追加致 recovery O(n) 慢 | Accepted — §3.9 INV-CM-SIDECAR-MAXSIZE |
+| M-OP-1..5 | A2 | flusher.py:98 替换代码缺失 / 纯辅助函数未命名 / select_tickfile_records 签名缺失 / seqno-monotonic 前提未验证 / _extract_minutes static→module | Accepted — §3.9 plan Task 0 前置 |
+
+Minor：lockfile 清理排除 today、INV-CM-REGEN-NO-SIDECAR-REWRITE 分支 2b 修正、audit log >4KB 原子性、rolling upgrade had_sidecar=false 监控噪音、跨日 offset 文档化。
+
+### Round 15 结论
+**3. 需要修改后进行 Round 16 复审。**（3 Critical + 9 Major。Agent 1 找到的 disk-full cascade（REGEN-GUARD 分支 1/2 死区→逐分钟回退销毁）是迄今最危险的传播链——触发条件（disk-full）生产高频，后果（已 commit 合法数据被销毁）不可恢复。Agent 2 从 plan 作者视角发现了 §7/§M-R3-2 矛盾 + 多处实现接缝缺失。Agent 3 找到跨天 pause 栅栏 + tamper 检测基准 + sidecar size 无上限。）
