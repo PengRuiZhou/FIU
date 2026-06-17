@@ -962,3 +962,41 @@ Minor：lockfile 清理排除 today、INV-CM-REGEN-NO-SIDECAR-REWRITE 分支 2b 
 
 ### Round 15 结论
 **3. 需要修改后进行 Round 16 复审。**（3 Critical + 9 Major。Agent 1 找到的 disk-full cascade（REGEN-GUARD 分支 1/2 死区→逐分钟回退销毁）是迄今最危险的传播链——触发条件（disk-full）生产高频，后果（已 commit 合法数据被销毁）不可恢复。Agent 2 从 plan 作者视角发现了 §7/§M-R3-2 矛盾 + 多处实现接缝缺失。Agent 3 找到跨天 pause 栅栏 + tamper 检测基准 + sidecar size 无上限。）
+
+---
+
+## Review Round 16（Round 15 修复后最终复审）
+
+### 审核时间
+* 2026-06-18 05:15:00
+
+### Round 15 复核
+全部 3 Critical（C-R15-1 disk-full cascade / C-R15-2 跨天 flush barrier / C-R15-3 tamper 多基准）+ 9 Major 在 §3.9 落实，7 个重点全部通过。0 Critical / 0 Major / 2 Minor（术语残留，已修）。
+
+### 结论
+**1. 可以进入 planning。**
+
+---
+
+## 最终审核结论（16 轮后）
+
+### 是否可以进入 planning
+**1. 可以进入 planning。** ✅
+
+### 16 轮审核完整总览
+| 组 | 轮次 | 角度 | 发现 | 处理 |
+|---|---|---|---|---|
+| 1 | R1-2 | in-file 正确性 | 8C+10M | 全修 |
+| 2 | R3-4 | 动态运行时 | 3C+12M | 全修 |
+| 3 | R5-6 | 新逻辑接缝 | 7C+2M | 全修 |
+| — | — | **用户确认** | csv→sidecar / 多进程→flock | pivot |
+| 4 | R7-8 | sidecar+flock | 5C+11M | 全修 |
+| 5 | R9-10 | 集成交互 | 2C+9M | 全修 |
+| 6 | R11-12 | 运维/性能/GIL | 1C+8M | 全修 |
+| 7 | R13-14 | 跨输出/篡改/可读性 | 2C+6M | 全修 |
+| 8 | R15-16 | cascade/plan/极端 | 3C+9M | 全修 |
+
+**累计**：28 Critical + 67 Major + ~38 Minor（全 Deferred 到 plan Task 0）。
+
+### Review log
+* `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
