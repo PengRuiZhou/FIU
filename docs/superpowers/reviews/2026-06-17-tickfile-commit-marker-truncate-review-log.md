@@ -696,3 +696,34 @@ Round 7 的 5 Critical（offset-fstat / flock-per-OFD / sidecar-in-lock / flock-
 
 ### Review log 路径
 * `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
+
+---
+
+## Review Round 9（一致性 + 集成交互 + 清理）
+
+### 审核时间
+* 2026-06-17 23:55:00
+
+### 综合问题清单
+
+#### Critical
+| ID | 来源 | 问题 | 决议 |
+| -- | ---- | ---- | ---- |
+| C-R9-1 | A1 | atomic-create 首次写 + sidecar 首建非原子：tickfile os.replace 成功但 sidecar open/append/fsync 失败 → tickfile 有首分钟数据但 sidecar 空 → recovery 降级不 truncate → 首分钟永久游离 + 后续 truncate 可能误截 | Accepted — §3.1 INV-CM-ATOMIC-CREATE-SIDECAR |
+| C-R9-2 | A2 | replay run() 仍无条件调 `_scan_generated_tickfile_minutes`（L101），spec 说 recovery 替换它——若两者并存 → 双数据源 → partial 分钟进 skip-set → 被跳过 → 永久 partial（正是本设计要修的 bug） | Accepted — §3.3 INV-CM-REPLAY-SCAN-REPLACED |
+
+#### Major
+| ID | 来源 | 问题 | 决议 |
+| -- | ---- | ---- | ---- |
+| M-R9-1 | A1 | checkpoint output_minutes vs sidecar committed_set 崩溃后可能分歧 → snapshot/tickfile 不一致 | Accepted — §3.3 文档化风险 + 定义对账行为 |
+| M-R9-2 | A1 | cross-day sidecar 生命周期（旧日不删、新日首分钟 atomic-create sidecar、跨日后禁写旧日） | Accepted — §3.3 INV-CM-CROSSDAY-SIDECAR |
+| M-R9-3 | A1 | REGEN-GUARD 分支 2 skip 时应禁止追加 sidecar（否则 dup WARNING 刷屏） | Accepted — §3.4 INV-CM-REGEN-NO-SIDECAR-REWRITE |
+| M-R9-4 | A2 | add(minute_key) 须在 sidecar fsync 之后（锁定时序防回归） | Accepted — §3.4 INV-CM-ADD-AFTER-SIDECAR |
+| M-R9-5 | A3 | §7 ~15 条 in-file marker 测试未清理（自相矛盾指令） | Accepted — §7 加 [DEPRECATED] 标注 + plan Task 0 重写 |
+| M-R9-6 | A3 | §8 风险表 4 条 in-file 残留 | Accepted — §8 标注已消除 |
+| M-R9-7 | A3 | §2/§4/§9/§10 "marker"→"sidecar" 措辞 + 过时 INV 名 | Accepted — plan Task 0 全文清理 |
+
+Minor（Deferred）：_extract_minutes 精确命名、flusher __init__ fallback 赋值序列、sidecar 末行读取方式、dedup/REGEN 等价性文档、replay runtime add、deferred 清单汇总。
+
+### Round 9 结论
+**3. 需要修改后进行 Round 10 复审。**（2 Critical + 7 Major。C-R9-1/C-R9-2 是 sidecar 与现有系统的真实集成缺口——atomic-create 首建非原子 + replay scan 双数据源。必须 spec 闭环。）
