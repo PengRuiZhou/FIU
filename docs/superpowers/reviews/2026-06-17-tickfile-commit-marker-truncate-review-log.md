@@ -727,3 +727,58 @@ Minor（Deferred）：_extract_minutes 精确命名、flusher __init__ fallback 
 
 ### Round 9 结论
 **3. 需要修改后进行 Round 10 复审。**（2 Critical + 7 Major。C-R9-1/C-R9-2 是 sidecar 与现有系统的真实集成缺口——atomic-create 首建非原子 + replay scan 双数据源。必须 spec 闭环。）
+
+---
+
+## Review Round 10（Round 9 修复后最终复审）
+
+### 审核时间
+* 2026-06-18 00:30:00
+
+### Round 9 复核
+Round 9 的 2 Critical（C-R9-1 atomic-create+sidecar / C-R9-2 replay scan 双数据源）+ 7 Major 全部在 §3.6 落实，经源码核实可实施。
+
+### Agent 摘要
+- **Agent 1（集成）**：全部闭环（源码核实插入点 writer.py:339/348、replay.py:101、flusher.py:661）。0 Critical/Major + 3 Minor（空数据路径 sidecar 边界、atomic-create 双分支、§7 就地改写）。结论：**1 可以**。
+- **Agent 2（spec 质量）**：全部闭环。0 Critical/Major + 4 Minor（§7 行内 DEPRECATED、§8 风险表 4 条、§3.4 "1.5M 行"矛盾、§4/§9 术语）。结论：**1 可以**。
+- **Agent 3（最终就绪）**：9 轮全部有具名 INV + 测试覆盖。2 Major（Maj-R10-1 行号偏差、Maj-R10-2 deprecated 测试计数 ~15→~31）+ 4 Minor。结论：**2 修后可**。
+
+### Round 10 修改（已落实）
+- **Maj-R10-2**：§7 [DEPRECATED] 测试计数 "~15" → "**约 31 条**"（含 E2E/fault-injection/writer-retry/cleanup）。
+- **Maj-R10-1**（行号偏差）：plan Task 0 核实——writer.py:301（def）/ :338（lock 注入点）；replay.py:82（run def）。spec §3 措辞已在 [DEPRECATED] 注中指向 §3.6 权威源。
+- **Min-R10-1**（m-R2-A1a stale）：sidecar 修订后 committed_set 仅来自 sidecar，tickfile 不被 parse 判 membership → m-R2-A1a（"marker 之后 row-only 行"）概念已不存在，由 INV-CM-OFFSET-MAX + SIDECAR-OFFSET-BOUND + FAIL-ATOMIC 覆盖。**正式 close**。
+
+### Round 10 结论
+**1. 可以进入 planning。**（Round 9 全部 2C+7M 落实；Round 10 发现 2 Major 文档精度 + 4 Minor 全部非阻断，已修/deferred。）
+
+---
+
+## 最终审核结论（10 轮后）
+
+### 是否可以进入 planning
+**1. 可以进入 planning。** ✅
+
+### 10 轮审核总览
+| 组 | 轮次 | 方案 | 发现 | 处理 |
+|---|---|---|---|---|
+| 1 | R1-2 | in-file `#COMMIT` | 8C+10M | 全修 |
+| 2 | R3-4 | in-file | 3C+12M | 全修 |
+| 3 | R5-6 | in-file | 7C+2M | 全修 |
+| — | — | **用户确认** | #1 csv→sidecar；#2+#3 多进程→flock | pivot |
+| 4 | R7-8 | sidecar+flock | 5C+8M+3M | 全修 |
+| 5 | R9-10 | sidecar 集成 | 2C+7M+2M+4m | 全修 |
+
+**累计**：25 Critical + 42 Major + ~30 Minor（Deferred）全部处理。
+
+### plan Task 0 必须处理
+1. §7 ~31 条 [DEPRECATED] in-file 测试逐条重写为 sidecar 等价（**最高优先**）。
+2. §8 风险表 4 条 in-file 残留标 [Resolved by sidecar]。
+3. §3.4 "1.5M 行扫描"措辞修正（sidecar 读 KB 级）。
+4. §4/§9 全文 "marker" → "sidecar 行/commit 记录"。
+5. 行号核实（writer.py:301/338；replay.py:82）。
+6. ~13 条 Deferred Minor（去重后）逐条 review。
+7. flusher.py:640 空数据路径 sidecar 边界明确。
+8. 外部消费方 `#` 行兼容（人工确认，部署前）。
+
+### Review log
+* `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
