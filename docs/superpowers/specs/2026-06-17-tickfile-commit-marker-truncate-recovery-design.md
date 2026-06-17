@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ Review 通过（R1: 7C+6M；R2: 1C+4M；R3: 3C+10M；R4: 2M；R5: 7M 全修复），可进入 planning
+> **Status**: ✅ Review 通过（R1: 7C+6M；R2: 1C+4M；R3: 3C+10M；R4: 2M；R5: 7M；R6: 2M 全修复），可进入 planning
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -259,7 +259,7 @@ def _is_legal_last_line(line):
 
 **端到端（C6 + M-R2-2，核心价值证明，双路径）**：
 - `test_e2e_mid_append_crash_recovery`（replay 路径）：helper 写 `[header + 0901 rows + #COMMIT,0901,N + 0902 partial rows (no marker)]`，调 `ReplayEngine.run()` with snapshot 含 0901+0902 → 断言：最终 `#COMMIT` 数=2、0901 行数不变、0902 行数=预期、无空行无重复。模板：stale-fix `test_replay_fills_gap_without_corrupting_correct_rows`。
-- `test_e2e_live_restart_recovers_partial_minute`（**live restart 路径，M-R2-2**）：helper 写 `[header + 0901 rows + #COMMIT,0901,N + 0902 partial rows]` → 构造 `Engine`（mock feed 给 0902 snapshot/order）→ `Engine.start()` → 等 writer 处理 0902 → `Engine.stop()` → 断言：文件末行 `#COMMIT,0902,M`、0901 行数不变、0902 行数=预期、无重复无空行、`.truncated.*` 备份存在（若 truncate 发生）。**这是生产硬崩恢复的真实路径，必须闭环**。若 live feed mock 太重，退化为半闭环：`Engine.start()` 后立即 stop → 断言文件已 truncate + skip-set 已填（INV-CM-SKIPSET-LIVE）+ writer 未重生已 commit 分钟。
+- `test_e2e_live_restart_recovers_partial_minute`（**live restart 路径，M-R2-2，强制不退化半闭环**）：helper 写 `[header + 0901 rows + #COMMIT,0901,N + 0902 partial rows]` → 种子 csv_dir（snapshot.csv+code.csv 喂 0902，复用 stale-fix 模式）→ 构造 `Engine` + `.start()` + 轮询 `engine._tickfile_dequeue_count` 直到处理完 0902 → `.stop()` → 断言：文件末行 `#COMMIT,0902,M`、0901 行数不变、0902 行数=预期、无重复无空行、`.truncated.*` 备份存在（若 truncate 发生）。**这是生产硬崩恢复的真实路径，必须强制闭环**（feed seam = seed csv_dir + poll，零生产侵入）。
 
 **外部 consumer 兼容（C5）**：
 - `test_external_csv_reader_skips_hash_lines`：标准 csv.reader 解析含 `#COMMIT` 行的 tickfile，断言跳过/显式处理。
@@ -275,7 +275,12 @@ def _is_legal_last_line(line):
 - `test_writer_ioerror_after_marker_write_no_duplicate`（**M-R4-1a**）：rows+marker 已写（page cache），`os.fsync` 抛 IOError → re-insert → retry → precondition 见末尾合法 marker 且 minute==current → **skip append + 标 committed** → 无重复。
 - `test_writer_health_check_calls_recovery_before_restart`（C-R3-1）：writer 死亡 → health_check → recovery 被调 + skip-set 同步。
 - `test_replay_rejects_concurrent_live_date`（C-R3-3）：pidfile 占用 → replay abort。
+- `test_replay_guard_atomic_excl_rejects_concurrent_start`（**M-R5-4/Maj-R6-2**）：两线程并发 EXCL open 只一成功（实现提示：用预创建文件模拟"已存在 → FileExistsError"，纯 Python 真并发不可靠）。
+- `test_replay_guard_reclaims_stale_pidfile_after_live_crash`（**M-R5-4/Maj-R6-2**）：stale pidfile + pid 死（如 999999）→ replay 成功 + WARNING `stale_pidfile_reclaimed`（实现提示：monkeypatch `os.kill`/win32 ctypes 模拟 pid liveness）。
+- `test_replay_guard_aborts_when_live_pid_alive`（**M-R5-4/Maj-R6-2**）：pidfile + pid 活 → abort。
 - `test_recovery_returns_seqno_from_committed_only`（M-R3-4）：partial 行 seqno 不进返回值。
+- `test_recovery_seqno_override_takes_max_never_regresses`（**M-R5-2/Maj-R6-1**）：构造内存 seqno=10（分支 2 skip 消耗）+ 文件 last_seqno=9 → recovery 覆盖后 `_tickfile_seqno == max(9,10) == 10`，下一分钟写 seqno=11（非 10 重用）。证 INV-CM-SEQNO-MONO-FILE。
+- `test_flusher_init_runs_recovery_before_eager_seqno_fetch`（**M-R5-1/Maj-R6-1**）：构造含 partial 分钟 tickfile → `_make_flusher(...)`（不调 start，触发 `__init__` eager）→ 断言文件已 truncate + `state._tickfile_seqno` 取自干净文件（非 partial）。证 INV-CM-ORDER-1 init 点。
 - `test_recover_filters_out_wrong_date_markers`（M-R3-5）：跨日 marker → WARNING，不进 committed_set。
 - `test_recovery_backup_no_collision_rapid_double`（M-R3-3）：同秒双 truncate → 两份备份（time_ns+pid）。
 - `test_cleanup_tmp_requires_marker_before_replace`（M-R3-2）：.tmp 无 marker → 删，不 replace。
