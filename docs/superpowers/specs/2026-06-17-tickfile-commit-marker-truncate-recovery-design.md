@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 18 轮 review 完成（9 组 × 2 轮），sidecar + fcntl.flock + 跨输出对账 + 篡改防护 + cascade 防护 + 部署 runbook 方案可进入 planning。
+> **Status**: 19 轮 review（+round-up 集成/BG writer 交互/fd 泄漏），待 Round 20 复审。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -316,7 +316,49 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 
 关键不变量（重申 INV-CM-MONO / INV-CM-LAST）：**文件有效内容 = 截到最后一个合法 marker**；truncate 后末行必为合法 marker。marker 之后的一切都是未提交的，可安全丢弃重生。
 
-### 3.10 Round 17 文件耦合 / 测试策略 / 部署 runbook（实施级增补）
+### 3.11 Round 19 round-up 集成 / Phase 18 BG writer 交互 / fd 生命周期（系统级增补）
+
+> 前 18 轮覆盖设计正确性到部署 runbook；Round 19 从**Phase 22 round-up 语义变更的跨版本混存 + Phase 18 BG writer 的 pause/resume/health-check 实际代码与 spec INV 的对齐 + fd 生命周期泄漏**三个角度审查。
+
+**C-R19-1 — Phase 22 round-up 边界混存：旧 round-down tickfile + 新 round-up tickfile 同 output_dir**
+- **场景**：Phase 22（左开右闭 round-up，commit d606692→76830d2）前的 tickfile 用旧 round-down 语义（`15:30:00→1529`），Phase 22 后用新 round-up（`15:30:00→1530`）。若同一 output_dir 内混存旧 + 新语义的 tickfile 行 → `_extract_minutes_from_tickfile`（降级路径）切出的 minute_key 含旧语义键（1529），而新代码 committed_set 用新语义键（1530）→ **replay 视旧 1529 为 gap → 重生 → 与旧行并存或字面重复**。
+- **INV-CM-ROUNDUP-BOUNDARY**：sidecar recovery 首跑（`had_sidecar=False` 降级 + tickfile 非平凡）时，audit log 记录 `legacy_last_updatetime`（tickfile 末行 UpdateTime 原始值），供运维判断是否跨越 Phase 22 边界。
+- **replay-to-fresh 升级为 SHOULD**（M-R17-A8 的 RECOMMENDED 升级）：round-up 边界混存是 replay-to-fresh 的**硬触发条件**（spec §6 明写）。
+- 测试 `test_roundup_boundary_mixed_file_emits_warning`。
+
+**C-R19-2 — engine.py:1458 health-check 实际不调 recovery，spec INV-CM-ORDER-RESTART 未落地**
+- **场景**：writer 线程死亡（engine.py:1458 health-check）→ 实际代码只 `drain + new thread`（L1477-1493），**无 recovery、无 skip-set 同步**。spec §3.4 INV-CM-ORDER-RESTART 要求"health-check restart 前调 recovery"——**与代码直接矛盾**。
+- writer 死前最后一次 append 的 partial rows（tickfile fsync 后 sidecar fsync 前）→ health-check 重启新 writer → 新 writer 取**下个** mk → REGEN-GUARD 读 sidecar 末行（= 上分钟 N-1 < 当前 N+1）→ 走分支 1a → **不检测 tickfile 已含 N 的 partial rows** → append N+1 在 partial N 尾后 → **partial N 永久残留**。
+- **Reconcile §3.4 / §3.5 M-R5-7**：
+  - **选项 A（推荐）**：health-check 在 `drain` **之前**调 `_recover_tickfile_to_last_commit`（同步 committed_set 到 `_state._generated_tickfile_minutes`）。代价几 ms（sidecar 几 KB 读），可承受（health-check writer 死亡才触发，每日 0-1 次）。
+  - 选项 B：依赖 C-R15-1 修正的二元四分支（分支 1b `size>offset → truncate`）。但需确认 health-check 路径的 REGEN-GUARD 用修正后四分支——依赖多。
+  - spec §3.5 M-R5-7 说"health-check restart 无需全量 recovery"——**须改为"health-check restart 须调 full recovery（选项 A），几 ms 可承受"**。
+  - §3.3 调用点表加 `| health-check restart (engine.py:1458) | _recover_tickfile_to_last_commit + skip-set sync | _state._generated_tickfile_minutes | (本路径专用) |`。
+
+**M-R19-1 — `_tickfile_writer_pause` 无旧日 recovery 栅栏**
+- engine.py:1367-1428 的 pause = `SENTINEL + join + drain`，**无旧日 recovery**（C-R15-2 INV-CM-CROSSDAY-FLUSH-BARRIER 未落地）。
+- **修正**：pause 在 `_tickfile_writer_drain()`（L1422）**之后、返回前**，对当前（旧）date 调 `_recover_tickfile_to_last_commit`。此时 writer 已 join 死，无并发，安全。
+
+**M-R19-2 — flock fd 须 `with` 嵌套模板**
+- **INV-CM-FLOCK-WITH-NESTED**：flock fd 必须是 `_get_write_lock` 的 `with` 块**内嵌套**的 `with open(lockfile)`：
+  ```python
+  with _get_write_lock(path):                    # RLock (进程内)
+      with open(lockpath, "a") as lockfile_f:    # with 保证 fd close
+          fcntl.flock(lockfile_f.fileno(), LOCK_EX|LOCK_NB)
+          # tickfile append + fstat + sidecar append 全在此 with 内
+      # with 退出 → fd close → OFD flock 自动释放
+  ```
+  禁止裸 `open` + 手动 close（异常路径泄漏 → 永久持锁 → writer 死亡）。
+
+**M-R19-3 — `_tickfile_writer_drain` 失败 partial 无 recovery 兜底**
+- drain（L1311-1365）循环 `_try_generate_tickfile(mk)` 失败 → `except Exception: logger.exception`（不 re-insert、不 recovery）。pause/resume/health-check 三路径都调 drain。
+- **修正**：drain 结束后（return 前）对当前 date 调一次 `_recover_tickfile_to_last_commit` 清 drain 残留 partial（drain 本就 rare，几 ms 可接受）。或 drain 失败时 CRITICAL `tickfile_drain_ioerror_partial_left`（监控告警）。
+- §3.3 调用点表加 `| _tickfile_writer_drain (engine.py:1311, pause/resume/health-check 共用) | 可选 recovery 兜底 | N/A | 建议加 recovery |`。
+
+**Minor**
+- m-R19-1：`extract_minutes_from_tickfile` 提升后 docstring 注明"不重新 round-up"（防二次偏移）。
+- m-R19-2：prune RLock 条目 vs lockfile 永不删的协同文档化。
+- m-R19-3：health-check restart 上限措辞精确化（1 restart + 1 start = 2 recovery）。
 
 > 前 16 轮覆盖设计正确性；Round 17 从**文件改动耦合、测试可执行性、部署 runbook 实操性**三个角度审查，找到从"设计对"到"实施/部署不走偏"的 gap。
 
