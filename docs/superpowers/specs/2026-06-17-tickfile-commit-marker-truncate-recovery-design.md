@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: 19 轮 review（+round-up 集成/BG writer 交互/fd 泄漏），待 Round 20 复审。
+> **Status**: ✅ 20 轮 review 完成（10 组 × 2 轮），可进入 planning。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -173,7 +173,7 @@ POSIX 唯一的原子文件操作是 `rename`（整个文件替换）；**没有
 - 测试：`test_regen_guard_truncate_before_append_fd_open_no_sparse_gap`（truncate 与 open fd 间插桩，断言无零字节间隙）、`test_recovery_truncate_sharing_violation_aborts_clean`（monkeypatch os.truncate 抛 PermissionError → 文件不变、无备份、re-raise）。
 
 **M-R5-7 — writer restart 频率上限 + 永久死亡 metric + E2E feed seam**
-- **restart 上限文档**：`_tickfile_writer_restart_count` 硬上限 = 1（engine.py:1464 现状）→ 每进程最多 2 次 recovery 全扫（启动 1 + health-check 1）后 writer **永久死亡**（CRITICAL 日志）+ 进程级监控告警。加 metric `tickfile_writer_perm_dead`（0/1）。health-check 路径的 recovery 用 REGEN-GUARD per-append precondition（只扫末尾 4096，不扫全文件）——因 REGEN-GUARD 已保证每次 append 自愈，health-check restart 无需全量 recovery（避免 tick 循环阻塞）。
+- **restart 上限文档**：`_tickfile_writer_restart_count` 硬上限 = 1（engine.py:1464 现状）→ 每进程最多 2 次 recovery 全扫（启动 1 + health-check 1）后 writer **永久死亡**（CRITICAL 日志）+ 进程级监控告警。加 metric `tickfile_writer_perm_dead`（0/1）。health-check restart **须调 full recovery**（§3.11 C-R19-2 选项 A：几 ms 可承受，writer 死亡才触发，每日 0-1 次；§3.5 M-R5-7 原措辞"无需全量 recovery"已废弃）。
 - **E2E feed seam**（M-R5-7/A3）：`test_e2e_live_restart_recovers_partial_minute` 用**种子 csv_dir**（写 snapshot.csv+code.csv，复用 stale-fix 模式）+ 构造 `Engine` + `.start()` + **轮询 `engine._tickfile_dequeue_count`**（无锁引擎计数器，测试可读）直到处理完 0902 → `.stop()`。不新增生产 test-only 注入点（零侵入）。spec 明确此 seam。
 
 ### 3.6 Round 9 集成交互增补（sidecar 与现有系统接缝）
