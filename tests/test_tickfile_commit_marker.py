@@ -703,3 +703,88 @@ def test_e2e_live_restart_recovers_partial_minute(tmp_path):
     assert last_offset == len(data), \
         f"last sidecar offset {last_offset} != tickfile size {len(data)}"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 9 (T9) — "Full" proof tests:
+#   1. flock cross-process (subprocess) exclusion  [@slow, @requires_fcntl]
+#   2. pandas empirical csv-compat                  [@requires_pandas]
+#   3. no-pandas csv fallback (always runs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.slow
+@pytest.mark.requires_fcntl
+def test_flock_excludes_cross_process(tmp_path):
+    """fcntl.flock is per-OFD; a subprocess LOCK_EX|LOCK_NB on the same lockfile must fail (BLOCKED).
+
+    pytest.importorskip("fcntl") makes the @requires_fcntl marker effective: on Windows
+    (and any non-POSIX env without fcntl) this test is skipped cleanly instead of running
+    the subprocess (which would ModuleNotFoundError on `import fcntl`). On Linux CI fcntl
+    is present and the real cross-process exclusion is exercised.
+    """
+    pytest.importorskip("fcntl")  # skip on Windows / non-POSIX (@requires_fcntl)
+    import subprocess, sys
+    from minute_bar.writer import _flock_critical_section
+    lockfile = str(tmp_path / "tickfile_20260528.csv.lock")
+    open(lockfile, "a").close()
+    with _flock_critical_section(lockfile):
+        code = (
+            "import fcntl,sys\n"
+            f"f=open({lockfile!r},'a')\n"
+            "try:\n"
+            "    fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+            "    print('ACQUIRED'); sys.exit(0)\n"
+            "except BlockingIOError:\n"
+            "    print('BLOCKED'); sys.exit(1)\n"
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+        assert r.returncode == 1 and "BLOCKED" in r.stdout
+
+
+def _make_commit_marker_snapshot(symbol="7203", seqno=1):
+    """Real SnapshotRecord -> build_tickfile_row emits a full 65-field row (not 'NA')."""
+    from minute_bar.models import SnapshotRecord
+    return SnapshotRecord(
+        symbol=symbol, seqno=seqno, time=20260528093100999, rcvtime=20260528083100999,
+        preclose=443500.0, lastprice=455000.0, open=443500.0, high=455000.0,
+        low=440000.0, close=455000.0, lasttradeprice=455000.0, lasttradeqty=100,
+        totalvol=300, totalamount=135000000.0, sessionid=1, tradetype="",
+        status="T", direction=0, pflag="N", decimal=2, vwap=451000.0, shortsellflag=0,
+    )
+
+
+@pytest.mark.requires_pandas
+def test_tickfile_csv_pandas_empirical(tmp_path):
+    """C-R7-3 core: real pd.read_csv on a sidecar-era tickfile -> 65 cols, no '#' rows, no Unnamed cols; sidecar 4 cols."""
+    pd = pytest.importorskip("pandas")
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    date = "20260528"
+    for mk, seq in [(f"{date}0931", 1), (f"{date}0932", 2), (f"{date}0933", 3)]:
+        write_tickfile_rows(str(tmp_path), mk, [("7203", _make_commit_marker_snapshot(seqno=seq), None)],
+                            seq, enable_commit_marker=True)
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    df = pd.read_csv(tf)
+    assert df.shape[1] == 65
+    assert not any(str(c).startswith("#") for c in df.columns)
+    assert not any(str(c).startswith("Unnamed") for c in df.columns)
+    sc = pd.read_csv(tf + ".commit", header=None)
+    assert sc.shape[1] == 4
+    assert len(sc) == 3  # three committed minutes
+
+
+def test_tickfile_pure_csv_reader_no_hash_rows(tmp_path):
+    """Weak fallback (no pandas): csv.reader sees 65 fields/row incl header, no '#', sidecar 4 fields."""
+    import csv
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    date = "20260528"
+    write_tickfile_rows(str(tmp_path), f"{date}0931",
+                        [("7203", _make_commit_marker_snapshot(), None)], 1, enable_commit_marker=True)
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    with open(tf, newline="") as f:
+        rows = list(csv.reader(f))
+    assert all(len(r) == 65 for r in rows)        # header + data
+    assert not any(any(c.startswith("#") for c in r) for r in rows)
+    with open(tf + ".commit", newline="") as f:
+        sc = list(csv.reader(f))
+    assert all(len(r) == 4 for r in sc)
+
