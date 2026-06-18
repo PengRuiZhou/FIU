@@ -373,3 +373,333 @@ def test_health_check_calls_recovery_before_drain(tmp_path, monkeypatch):
         pass
     assert "recovery" in calls, "_run_tickfile_recovery must be called by health_check"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 8 (T8) — End-to-end recovery tests
+#
+# Spec M-R2-2 / M-R5-7 / A3: the production hard-crash recovery path must close
+# the loop end-to-end. Two E2E tests:
+#   1. test_e2e_mid_append_crash_recovery_replay        — replay path (concrete)
+#   2. test_e2e_live_restart_recovers_partial_minute    — live restart path
+#      (semi-integrated: real Engine.__init__ eager recovery + real
+#       _run_tickfile_recovery runtime recovery + real _try_generate_tickfile;
+#       see the test docstring for why the full FileTailer polling loop is not
+#       driven in-process).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.e2e
+def test_e2e_mid_append_crash_recovery_replay(tmp_path):
+    """Mid-append crash (replay path): committed 0931 + partial 0932 tail; replay
+    run() truncates the partial tail and regenerates 0932 cleanly, without
+    duplicating 0931.
+
+    Seed pattern cloned from tests/test_tickfile_stale_fix.py:197
+    (TestReplayGapFillIntegration): clock-minute 0930 -> tickfile bucket 202605200931
+    (the committed/seeded minute), clock-minute 0931 -> bucket 202605200932 (the gap
+    to regenerate). Phase 22 left-open-right-closed round-up means sub-minute>0
+    lands in bucket N+1.
+    """
+    import csv
+    from minute_bar.config import (AggregationConfig, AppConfig, InputConfig,
+                                   OutputConfig)
+    from minute_bar.replay import ReplayEngine
+    from minute_bar.tickfile import TICKFILE_HEADER
+    from minute_bar.writer import get_tickfile_path
+
+    date = "20260520"
+    out_dir = tmp_path / "output"
+    in_dir = tmp_path / "input"
+    in_dir.mkdir()
+    out_dir.mkdir()
+
+    # code.csv — 17-field format (proven in tests/test_replay.py:41).
+    (in_dir / f"code.csv.{date}").write_text(
+        "7203,1,TSE,Toyota,JPY,equity,common,,,,0,0,0,2,0,,0\n", encoding="utf-8")
+
+    # snapshot.csv — 21-field rows. Round-up: clock-min 0930 -> bucket 0931,
+    # clock-min 0931 -> bucket 0932.
+    snapshot_rows = [
+        # clock-minute 0930 -> tickfile bucket 202605200931 (committed/seeded)
+        "7203,20260520093000999,443500,450000,440000,451000,443500,450000,450000,100,100,45000000,1,,T,0,Y,2,0,0,20260520083000999",
+        # clock-minute 0931 -> tickfile bucket 202605200932 (gap to regenerate)
+        "7203,20260520093100999,443500,455000,440000,455000,443500,455000,455000,100,300,135000000,1,,T,0,Y,2,0,0,20260520083100999",
+    ]
+    with open(in_dir / f"snapshot.csv.{date}", "wb") as f:
+        for r in snapshot_rows:
+            f.write(r.encode("utf-8") + b"\n")
+
+    # Pre-seed the output tickfile with bucket 0931 COMMITTED (valid 65-field row
+    # + sidecar entry) and an un-sidecared PARTIAL 0932 tail (mid-append crash).
+    seed_path = get_tickfile_path(str(out_dir), f"{date}0931")  # one file per day
+    os.makedirs(os.path.dirname(seed_path), exist_ok=True)
+    fields = [""] * 65
+    fields[0] = "7203"
+    fields[1] = date
+    fields[16] = f"{date} 09:31:00"   # UpdateTime -> minute_key 202605200931
+    fields[59] = "1"                   # Seqno
+    fields[60] = "2026-05-20 09:30:00.999000"  # LocalTime
+    committed_block = TICKFILE_HEADER + "\n" + ",".join(fields) + "\n"
+    partial_tail = b"7203,partial,corrupt,tail,no,newline,bytes"   # NO sidecar entry
+    with open(seed_path, "wb") as f:
+        f.write(committed_block.encode("utf-8") + partial_tail)
+    committed_size = len(committed_block.encode("utf-8"))
+    with open(seed_path + ".commit", "w", encoding="utf-8") as f:
+        # sidecar authoritative for 0931 only (offset == committed_size, < file size)
+        f.write(f"{date}0931,{committed_size},1,1\n")
+
+    config = AppConfig(
+        input=InputConfig(csv_dir=str(in_dir), file_encoding="utf-8"),
+        output=OutputConfig(output_dir=str(out_dir), enable_order=False,
+                            enable_tickfile=True, enable_kline=False),
+        aggregation=AggregationConfig(first_seen_volume_base="start_totalvol"),
+    )
+    ReplayEngine(config, date=date).run()
+
+    # The partial tail bytes must be gone (truncated to last committed offset).
+    data = open(seed_path, "rb").read()
+    assert b"partial,corrupt" not in data, "partial tail was not truncated by recovery"
+
+    # Group surviving rows by minute_key (UpdateTime col 16).
+    with open(seed_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        next(reader)  # header
+        by_minute = {}
+        for row in reader:
+            if len(row) != 65:
+                continue
+            mk = row[16].replace(" ", "").replace(":", "")[:12]
+            by_minute[mk] = by_minute.get(mk, 0) + 1
+
+    # 0931 (committed) must be UNCHANGED — NOT duplicated by replay.
+    assert by_minute.get(f"{date}0931", 0) == 1, \
+        f"committed 0931 row duplicated/corrupted: count={by_minute.get(f'{date}0931')}"
+    # 0932 (the gap) must now be regenerated exactly once.
+    assert by_minute.get(f"{date}0932", 0) == 1, \
+        f"gap minute 0932 not regenerated cleanly: count={by_minute.get(f'{date}0932')}"
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+def test_e2e_live_restart_recovers_partial_minute(tmp_path):
+    """Live-restart recovery (M-R2-2 — the production hard-crash recovery real path).
+
+    Scenario simulated:
+      * A previous live Engine run committed minute 0931 (valid row + sidecar entry)
+        and crashed MID-APPEND on minute 0932, leaving an un-sidecared partial tail
+        on disk (exactly the INV-CM-FAIL-ATOMIC / mid-append scenario).
+      * A new Engine process starts (Engine.__init__) and the eager init recovery
+        truncates the partial tail to the last committed offset, syncing the
+        committed skip-set + seqno from the sidecar.
+      * The writer thread then dies again mid-append (re-corrupt), the health-check
+        path fires `_run_tickfile_recovery()` (the production runtime recovery
+        invoked at engine.py:1481), which truncates the fresh partial.
+      * The writer loop body (`_try_generate_tickfile`, the real method the writer
+        thread runs per dequeued minute) then regenerates 0932 cleanly, and the
+        new committed entry appears in the sidecar — no dup of 0931, no partial
+        bytes, no double sidecar entry.
+
+    PATH EXERCISED (semi-integrated):
+      This test drives the REAL production recovery path against a REAL live
+      `Engine` instance constructed from an AppConfig (so Engine.__init__ runs the
+      real ClockWatermarkFlusher.__init__ eager recovery, real CodeTable,
+      CheckpointManager, FileTailer wiring). It then invokes the REAL
+      `engine._flusher._run_tickfile_recovery()` (the same method
+      `_tickfile_writer_health_check` calls on writer-death restart) and the REAL
+      `engine._flusher._try_generate_tickfile(mk)` (the exact writer-loop body at
+      engine.py:1280-1290).
+
+      The only part NOT driven in-process is the FileTailer wall-clock polling
+      loop + the worker-thread spawn from `Engine.start()`. That loop is
+      orthogonal to recovery (it feeds data into the queue; recovery operates on
+      the on-disk tickfile + sidecar). Driving it here would couple the test to
+      the system clock, real-time file polling, and 4-thread convergence — the
+      same timing sensitivity that makes test_e2e_phase21_benchmark.py skip
+      unless real source data exists. The semi-integrated form exercises the
+      EXACT production recovery methods on a real Engine instance with zero
+      wall-clock dependence, and is the strongest reliable version in this
+      environment.
+
+      `jst_now_yyyymmdd` is patched to a fixed date (the established pattern from
+      tests/test_tickfile_sync.py:_make_flusher) so the seeded tickfile path
+      matches the recovery target date deterministically.
+    """
+    import csv
+    import glob
+    from unittest.mock import patch
+    from minute_bar.config import (AggregationConfig, AppConfig, InputConfig,
+                                   OutputConfig, RecoveryConfig)
+    from minute_bar.engine import Engine
+    from minute_bar.tickfile import TICKFILE_HEADER
+    from minute_bar.writer import get_tickfile_path
+
+    # Fixed date — patched into minute_bar.flusher.jst_now_yyyymmdd so both the
+    # eager init recovery and the runtime _run_tickfile_recovery target the same
+    # tickfile path that we seed below.
+    date = "20260602"
+    out_dir = tmp_path / "output"
+    csv_dir = tmp_path / "input"
+    csv_dir.mkdir()
+    out_dir.mkdir()
+
+    # Seed csv_dir with a code.csv + a snapshot.csv feeding minute 0932 (the
+    # partial minute we will regenerate). These files are not tail-consumed in
+    # this test (we drive _try_generate_tickfile directly), but they make the
+    # Engine's csv_dir realistic and let CodeTable.load() find a code row so
+    # tickfile row generation can resolve the symbol's name/market.
+    (csv_dir / f"code.csv.{date}").write_text(
+        "7203,1,TSE,Toyota,JPY,equity,common,,,,0,0,0,2,0,,0\n", encoding="utf-8")
+    (csv_dir / f"snapshot.csv.{date}").write_text(
+        "7203,20260602093100999,443500,455000,440000,455000,443500,455000,455000,100,300,135000000,1,,T,0,Y,2,0,0,20260602083100999\n",
+        encoding="utf-8")
+
+    tf = get_tickfile_path(str(out_dir), f"{date}0931")  # one file per day
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+
+    # Committed 0931 row (valid 65 fields) + partial 0932 tail (NO sidecar entry).
+    fields = [""] * 65
+    fields[0] = "7203"
+    fields[1] = date
+    fields[16] = f"{date} 09:31:00"
+    fields[59] = "1"                            # Seqno
+    fields[60] = "2026-05-20 09:30:00.999000"   # LocalTime
+    committed_block = TICKFILE_HEADER + "\n" + ",".join(fields) + "\n"
+    partial_tail = b"7203,partial,corrupt,0932,tail,no,newline"
+    with open(tf, "wb") as f:
+        f.write(committed_block.encode("utf-8") + partial_tail)
+    committed_size = len(committed_block.encode("utf-8"))
+    with open(tf + ".commit", "w", encoding="utf-8") as f:
+        # Sidecar authoritative for 0931; offset < file size => partial 0932 is
+        # un-sidecared residue that recovery must truncate.
+        f.write(f"{date}0931,{committed_size},1,1\n")
+
+    # ── Phase A: real Engine.__init__ runs eager recovery ──
+    # AppConfig shape mirrors tests/test_e2e_phase21_benchmark.py:131 (live mode),
+    # stripped of the Rust flags (Rust not required for recovery, and would raise
+    # RuntimeError if enable_order_accel=True without the extension installed).
+    config = AppConfig(
+        input=InputConfig(csv_dir=str(csv_dir), target_date=date,
+                          file_encoding="utf-8", poll_interval_ms=50),
+        output=OutputConfig(output_dir=str(out_dir), enable_order=True,
+                            enable_tickfile=True, enable_kline=False,
+                            enable_full_snapshot=False, enable_full_kline=False),
+        aggregation=AggregationConfig(first_seen_volume_base="start_totalvol"),
+        recovery=RecoveryConfig(
+            checkpoint_file=str(tmp_path / "engine_ckpt.json"),
+            output_delay_sec=0,
+            data_flush_delay_minutes=0,
+            enable_time_fallback=False,
+            stall_flush_sec=30,
+            enable_tickfile_commit_marker=True,
+        ),
+    )
+    with patch("minute_bar.flusher.jst_now_yyyymmdd", return_value=date):
+        engine = Engine(config)
+
+    # Eager init recovery MUST have truncated the partial tail to committed_size.
+    assert open(tf, "rb").read().endswith(committed_block.encode("utf-8")), \
+        "Engine.__init__ eager recovery did not truncate the partial 0932 tail"
+    assert b"partial,corrupt" not in open(tf, "rb").read(), \
+        "partial tail survived eager init recovery"
+    # Skip-set + seqno synced from sidecar.
+    assert f"{date}0931" in engine._state._generated_tickfile_minutes
+    assert engine._state._tickfile_seqno >= 1
+    # A .truncated.* backup of the dropped partial bytes should exist.
+    backups_after_init = glob.glob(tf + ".truncated.*")
+    assert len(backups_after_init) >= 1, "eager recovery created no truncation backup"
+    assert open(backups_after_init[0], "rb").read() == partial_tail, \
+        "truncation backup does not preserve the dropped partial bytes"
+
+    # ── Phase B: simulate a second mid-append crash + writer-death restart ──
+    # The writer thread crashes again mid-append on 0932, leaving a fresh partial.
+    fresh_partial = b"7203,AGAIN,partial,0932,tail,after,restart"
+    with open(tf, "ab") as f:
+        f.write(fresh_partial)
+    # Clear the in-memory skip-set/seqno so the runtime recovery's sync is
+    # observable (mirrors a fresh writer-thread state after death).
+    engine._state._generated_tickfile_minutes.clear()
+    engine._state._tickfile_seqno = 0
+
+    # Invoke the REAL production runtime recovery method — the exact call
+    # _tickfile_writer_health_check makes at engine.py:1481 before restarting
+    # the writer thread.
+    with patch("minute_bar.flusher.jst_now_yyyymmdd", return_value=date):
+        engine._flusher._run_tickfile_recovery()
+
+    # Runtime recovery MUST have truncated the fresh partial as well.
+    assert b"AGAIN,partial" not in open(tf, "rb").read(), \
+        "runtime _run_tickfile_recovery did not truncate the fresh partial"
+    assert open(tf, "rb").read().endswith(committed_block.encode("utf-8")), \
+        "runtime recovery corrupted the committed 0931 bytes"
+    # Sync happened again.
+    assert f"{date}0931" in engine._state._generated_tickfile_minutes
+    assert engine._state._tickfile_seqno >= 1
+
+    # ── Phase C: regenerate 0932 via the REAL writer-loop body ──
+    # Build the pending snapshot + order data the writer thread would have
+    # queued, then invoke the real _try_generate_tickfile (engine.py:1281 calls
+    # exactly this). Uses real SnapshotRecord/OrderRecord dataclasses (mirrors
+    # tests/test_tickfile_sync.py:_make_snapshot/_make_order).
+    from minute_bar.models import OrderRecord, SnapshotRecord
+    snap = SnapshotRecord(
+        symbol="7203", seqno=1, time=20260602093100999, rcvtime=20260602083100999,
+        preclose=443500.0, lastprice=455000.0, open=443500.0, high=455000.0,
+        low=440000.0, close=455000.0, lasttradeprice=455000.0, lasttradeqty=100,
+        totalvol=300, totalamount=135000000.0, sessionid=1, tradetype="",
+        status="T", direction=0, pflag="N", decimal=2, vwap=451000.0,
+        shortsellflag=0,
+    )
+    order = OrderRecord(
+        symbol="7203", seqno=1, time=20260602093100999,
+        bidprice=443500, bidsize=100, askprice=455000, asksize=200,
+        decimal=2, rcvtime=20260602083100999,
+    )
+    mk0932 = f"{date}0932"
+    engine._state._tickfile_pending[mk0932] = {
+        "raw_records": {"7203": [snap]},
+        "snapshot_copy": {"7203": snap},
+    }
+    engine._state.raw_order_buffers[mk0932] = [order]
+    # CodeTable needs the symbol loaded so build_tickfile_row can resolve name/market.
+    engine._code_table.load(date)
+    # The real writer-loop body. Must succeed, write exactly one 0932 row, and
+    # mark 0932 as generated.
+    engine._flusher._try_generate_tickfile(mk0932)
+
+    # ── Phase D: assertions ──
+    data = open(tf, "rb").read()
+    assert b"partial,corrupt" not in data and b"AGAIN,partial" not in data, \
+        "partial tail bytes survived the full recovery loop"
+    assert data.startswith(TICKFILE_HEADER.encode("utf-8")), \
+        "tickfile header lost during recovery/regeneration"
+
+    with open(tf, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        next(reader)  # header
+        by_minute = {}
+        for row in reader:
+            if len(row) != 65:
+                continue
+            mk = row[16].replace(" ", "").replace(":", "")[:12]
+            by_minute[mk] = by_minute.get(mk, 0) + 1
+
+    assert by_minute.get(f"{date}0931", 0) == 1, \
+        f"committed 0931 duplicated: count={by_minute.get(f'{date}0931')}"
+    assert by_minute.get(f"{date}0932", 0) == 1, \
+        f"regenerated 0932 not exactly one row: count={by_minute.get(f'{date}0932')}"
+    assert mk0932 in engine._state._generated_tickfile_minutes, \
+        "0932 not marked generated after _try_generate_tickfile"
+
+    # Sidecar must now contain BOTH committed minutes, each offset == tickfile size
+    # at the time of commit, and no duplicate entries.
+    rec_lines = [l.strip() for l in open(tf + ".commit", encoding="utf-8") if l.strip()]
+    rec_minutes = [l.split(",", 1)[0] for l in rec_lines]
+    assert rec_minutes.count(f"{date}0931") == 1, \
+        f"sidecar 0931 not exactly once: {rec_minutes}"
+    assert rec_minutes.count(f"{date}0932") == 1, \
+        f"sidecar 0932 not exactly once: {rec_minutes}"
+    # Last sidecar offset must equal the final tickfile size (INV-CM-OFFSET-FSTAT).
+    last_offset = int(rec_lines[-1].split(",")[1])
+    assert last_offset == len(data), \
+        f"last sidecar offset {last_offset} != tickfile size {len(data)}"
+
