@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 
@@ -108,3 +110,94 @@ def test_classify_precondition_committed_skip(tmp_path):
         f.write("202605280931,102,5,2\n")    # last == current, size==offset
     kind, last_rec = _classify_append_precondition("202605280931", tf + ".commit", tf)
     assert kind == "committed"
+
+
+from minute_bar.tickfile import TICKFILE_HEADER
+
+
+def test_write_appends_rows_and_sidecar_offset_matches(tmp_path):
+    """INV-CM-ORDERED-TWO-FILE + INV-CM-OFFSET-FSTAT: after write, sidecar records offset == tickfile size, seqno correct."""
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path, _parse_commit_line
+    import os
+    selected = [("7203", None, None)]
+    date = "20260528"
+    write_tickfile_rows(str(tmp_path), f"{date}0931", selected, 1,
+                        code_table_getter=None, skip_fsync=False, enable_commit_marker=True)
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    sc = tf + ".commit"
+    assert os.path.exists(sc)
+    size = os.path.getsize(tf)
+    with open(sc) as f:
+        line = f.readline().strip()
+    rec = _parse_commit_line(line)
+    assert rec is not None
+    assert rec[0] == f"{date}0931"
+    assert rec[1] == size          # offset == tickfile size after write
+    assert rec[3] == 1             # seqno
+
+
+def test_write_skip_fsync_skips_sidecar_fsync(tmp_path, monkeypatch):
+    """INV-CM-SKIP-FSYNC: skip_fsync=True -> no fsync at all (sidecar included)."""
+    from minute_bar.writer import write_tickfile_rows
+    import os as _os
+    calls = {"n": 0}
+    real_fsync = _os.fsync
+    def counting(fd):
+        calls["n"] += 1
+        return real_fsync(fd)
+    monkeypatch.setattr(_os, "fsync", counting)
+    write_tickfile_rows(str(tmp_path), "202605280931", [("7203", None, None)], 1,
+                        skip_fsync=True, enable_commit_marker=True)
+    assert calls["n"] == 0
+
+
+def test_write_committed_skip_no_duplicate(tmp_path):
+    """REGEN branch 2a: sidecar last == current, size == offset -> skip, no new rows, no sidecar dup."""
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    import os
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    content = TICKFILE_HEADER + "\n" + "r" * 50 + "\n"
+    with open(tf, "wb") as f:
+        f.write(content.encode())
+    size = os.path.getsize(tf)
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,{size},1,7\n")
+    before = open(tf, "rb").read()
+    write_tickfile_rows(str(tmp_path), f"{date}0931", [("7203", None, None)], 8,
+                        enable_commit_marker=True)
+    assert open(tf, "rb").read() == before  # unchanged
+    assert len([l for l in open(tf + ".commit") if l.strip()]) == 1  # no dup sidecar line
+
+
+def test_write_truncate_rewrite_residue_no_duplicate(tmp_path):
+    """REGEN branch 1b/2b: size > offset -> truncate to offset, then write fresh, residue gone."""
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    import os
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed = TICKFILE_HEADER + "\n" + ",".join(["x"] * 65) + "\n"   # committed minute (valid 65-field row)
+    residue = "PARTIAL_GARBAGE_NO_NEWLINE"                    # uncommitted partial tail
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + residue.encode())
+    committed_size = len(committed.encode())
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0930,{committed_size},1,1\n")        # last minute < current
+    write_tickfile_rows(str(tmp_path), f"{date}0931", [("7203", None, None)], 2,
+                        enable_commit_marker=True)
+    data = open(tf, "rb").read()
+    assert b"PARTIAL_GARBAGE_NO_NEWLINE" not in data   # residue truncated away
+    assert data.startswith(TICKFILE_HEADER.encode())
+
+
+def test_write_legacy_mode_no_sidecar(tmp_path):
+    """enable_commit_marker=False: no sidecar written, no flock (pure legacy append)."""
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    import os
+    write_tickfile_rows(str(tmp_path), "202605280931", [("7203", None, None)], 1,
+                        enable_commit_marker=False)
+    tf = get_tickfile_path(str(tmp_path), "202605280931")
+    assert not os.path.exists(tf + ".commit")  # no sidecar
+    assert os.path.exists(tf)

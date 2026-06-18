@@ -311,6 +311,17 @@ def get_tickfile_path(output_dir: str, minute_key: str) -> str:
                         f"tickfile_{date_str}.csv")
 
 
+@contextlib.contextmanager
+def _nullctx():
+    yield None
+
+
+def _fstat_size_after(path: str) -> int:
+    """Read post-write size via fstat on a fresh fd (INV-CM-OFFSET-FSTAT)."""
+    with open(path, "rb") as f:
+        return os.fstat(f.fileno()).st_size
+
+
 def write_tickfile_rows(
     output_dir: str,
     minute_key: str,
@@ -318,12 +329,15 @@ def write_tickfile_rows(
     seqno: int,
     code_table_getter=None,
     skip_fsync: bool = False,
+    enable_commit_marker: bool = True,
 ) -> None:
     if not selected:
         return
 
     path = get_tickfile_path(output_dir, minute_key)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    sidecar_path = path + ".commit"
+    lockfile_path = path + ".lock"
 
     rows = []
     skipped = 0
@@ -332,116 +346,113 @@ def write_tickfile_rows(
             row = build_tickfile_row(snap, order, seqno, code_table_getter, minute_key)
             rows.append(row)
         except Exception:
-            logger.error(
-                "Tickfile row build failed for symbol %s seqno=%d",
-                symbol, seqno, exc_info=True,
-            )
+            logger.error("Tickfile row build failed for symbol %s seqno=%d", symbol, seqno, exc_info=True)
             skipped += 1
 
     if not rows:
-        logger.warning(
-            "Tickfile: skipped %d/%d symbols for minute=%s",
-            skipped, len(selected), minute_key,
-        )
-        raise IOError(
-            f"All tickfile rows failed to build for minute={minute_key} "
-            f"({skipped}/{len(selected)} symbols skipped)"
-        )
+        logger.warning("Tickfile: skipped %d/%d symbols for minute=%s", skipped, len(selected), minute_key)
+        raise IOError(f"All tickfile rows failed to build for minute={minute_key} ({skipped}/{len(selected)})")
 
-    with _get_write_lock(path):
-        if not os.path.exists(path):
+    with _get_write_lock(path):  # in-process RLock (INV-CM-LOCK)
+        flock_cm = _flock_critical_section(lockfile_path) if enable_commit_marker else _nullctx()
+        with flock_cm:  # cross-process (INV-CM-SIDECAR-IN-LOCK / FLOCK-WITH-NESTED)
             content = TICKFILE_HEADER + "\n" + "\n".join(rows) + "\n"
-            tmp_path = path + ".tmp"
-            try:
-                with open(tmp_path, "w", encoding="utf-8", newline="") as f:
-                    f.write(content)
-                    f.flush()
-                    if not skip_fsync:
-                        os.fsync(f.fileno())
-                os.replace(tmp_path, path)
-            except Exception:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
-        else:
-            # Read first line in binary mode for robustness against corrupted data
-            with open(path, "rb") as f:
-                first_line_bytes = f.readline()
-            first_line = first_line_bytes.decode("utf-8", errors="replace").strip()
-            if first_line != TICKFILE_HEADER:
-                file_size = os.path.getsize(path)
-                if file_size == 0:
-                    logger.info(
-                        "Tickfile header rewrite: %s (empty or header-only file, overwritten)",
-                        path,
-                    )
-                    content = TICKFILE_HEADER + "\n" + "\n".join(rows) + "\n"
-                    tmp_path = path + ".tmp"
-                    try:
-                        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
-                            f.write(content)
-                            f.flush()
-                            if not skip_fsync:
-                                os.fsync(f.fileno())
-                        os.replace(tmp_path, path)
-                    except Exception:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                        raise
-                else:
-                    logger.error("Tickfile file exists but header corrupted: %s", path)
-                    raise IOError(f"Tickfile header corrupted, cannot append: {path}")
-                return
 
-            # Check for truncated last line using seek (replaces readlines for performance)
-            # MUST be inside `with _get_write_lock(path):` block for TOCTOU safety (N5)
-            need_newline_fix = False
-            file_size = os.path.getsize(path)
-            tail_size = min(file_size, TICKFILE_TAIL_READ_SIZE)
-            if tail_size > 0:
+            if enable_commit_marker:
+                kind, last_rec = _classify_append_precondition(minute_key, sidecar_path, path)
+                if kind == "committed":
+                    # branch 2a: already committed -> file-level skip, zero bytes (INV-CM-REGEN-NO-SIDECAR-REWRITE).
+                    logger.debug("Tickfile REGEN skip (committed): minute=%s", minute_key)
+                    return
+                if kind == "truncate_rewrite":
+                    # branch 1b/2b: truncate path-based BEFORE append fd open (INV-CM-TRUNCATE-BEFORE-OPEN).
+                    os.truncate(path, last_rec[1])
+                file_existed_before = os.path.exists(path)
+            else:
+                kind, file_existed_before = "legacy", os.path.exists(path)
+
+            # --- write tickfile rows (atomic-create vs append) ---
+            if not file_existed_before:
+                tmp_path = path + ".tmp"
+                try:
+                    with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+                        f.write(content)
+                        f.flush()
+                        if not skip_fsync:
+                            os.fsync(f.fileno())
+                    os.replace(tmp_path, path)
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
+                offset = _fstat_size_after(path)
+            else:
                 with open(path, "rb") as f:
-                    f.seek(-tail_size, 2)
-                    tail_bytes = f.read()
-                last_line = ""
-                for raw_line in reversed(tail_bytes.split(b'\n')):
-                    stripped = raw_line.strip()
-                    if stripped:
+                    first_line = f.readline().decode("utf-8", errors="replace").strip()
+                if first_line != TICKFILE_HEADER:
+                    file_size = os.path.getsize(path)
+                    if file_size == 0:
+                        logger.info("Tickfile header rewrite: %s", path)
+                        tmp_path = path + ".tmp"
                         try:
-                            last_line = stripped.decode("utf-8", errors="strict")
-                        except UnicodeDecodeError:
-                            logger.warning(
-                                "Tickfile tail check: non-UTF8 bytes in last line of %s, "
-                                "treating as corrupted",
-                                path,
-                            )
+                            with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+                                f.write(content)
+                                f.flush()
+                                if not skip_fsync:
+                                    os.fsync(f.fileno())
+                            os.replace(tmp_path, path)
+                        except Exception:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                            raise
+                        offset = _fstat_size_after(path)
+                    else:
+                        raise IOError(f"Tickfile header corrupted, cannot append: {path}")
+                else:
+                    need_newline_fix = False
+                    file_size = os.path.getsize(path)
+                    tail_size = min(file_size, TICKFILE_TAIL_READ_SIZE)
+                    if tail_size > 0:
+                        with open(path, "rb") as f:
+                            f.seek(-tail_size, 2)
+                            tail_bytes = f.read()
+                        last_line = ""
+                        for raw_line in reversed(tail_bytes.split(b'\n')):
+                            stripped = raw_line.strip()
+                            if stripped:
+                                try:
+                                    last_line = stripped.decode("utf-8", errors="strict")
+                                except UnicodeDecodeError:
+                                    need_newline_fix = True
+                                break
+                        if last_line and len(last_line.split(',')) != 65:
                             need_newline_fix = True
-                            break
-                        break
-                if last_line and len(last_line.split(',')) != 65:
-                    need_newline_fix = True
-                    logger.warning(
-                        "Tickfile truncated last line detected: %s, appending newline before new data",
-                        path,
-                    )
+                    if kind == "truncate_rewrite" and need_newline_fix:
+                        logger.critical("Tickfile newline-fix after REGEN truncate (offset mismatch) minute=%s path=%s",
+                                        minute_key, path)
+                        raise IOError(f"REGEN truncate offset mismatch for {minute_key}")
+                    with open(path, "a", encoding="utf-8", newline="") as f:
+                        if need_newline_fix:
+                            f.write("\n")
+                        for row in rows:
+                            f.write(row + "\n")
+                        f.flush()
+                        if not skip_fsync:
+                            os.fsync(f.fileno())
+                        offset = os.fstat(f.fileno()).st_size  # INV-CM-OFFSET-FSTAT (same fd, after fsync)
 
-            with open(path, "a", encoding="utf-8", newline="") as f:
-                if need_newline_fix:
-                    f.write("\n")
-                for row in rows:
-                    f.write(row + "\n")
-                f.flush()
-                if not skip_fsync:
-                    os.fsync(f.fileno())
+            # --- sidecar commit (only when enabled + a real write happened) ---
+            if enable_commit_marker:
+                line = f"{minute_key},{offset},{len(rows)},{seqno}\n"
+                with open(sidecar_path, "a", encoding="utf-8", newline="") as sf:
+                    sf.write(line)
+                    sf.flush()
+                    if not skip_fsync:
+                        os.fsync(sf.fileno())  # INV-CM-ORDERED-TWO-FILE: tickfile fsync already done above
 
-    logger.info(
-        "Tickfile append: %s minute=%s (%d symbols, seqno=%d)",
-        path, minute_key, len(rows), seqno,
-    )
+    logger.info("Tickfile append: %s minute=%s (%d symbols, seqno=%d)", path, minute_key, len(rows), seqno)
     if skipped > 0:
-        logger.warning(
-            "Tickfile: skipped %d/%d symbols for minute=%s",
-            skipped, len(selected), minute_key,
-        )
+        logger.warning("Tickfile: skipped %d/%d symbols for minute=%s", skipped, len(selected), minute_key)
 
 
 def _parse_commit_line(line: str) -> Optional[Tuple[str, int, int, int]]:

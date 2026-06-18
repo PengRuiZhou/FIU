@@ -149,6 +149,11 @@ class TestSeekTailCheckDetectsTruncation:
     """Spec N5: seek detects truncated last line."""
 
     def test_truncated_line_detected(self, tmp_path):
+        # Legacy seek-tail repair path (Phase 18). Uses enable_commit_marker=False because
+        # the commit-marker feature (default True) intentionally treats in-place file
+        # shrinking after a committed write as a "committed anomaly -> skip" (file size <
+        # sidecar offset). This test manually corrupts the file between writes, which only
+        # the legacy code path repairs via the seek-tail newline fix.
         from minute_bar.writer import write_tickfile_rows, get_tickfile_path
         from minute_bar.tickfile import TICKFILE_HEADER
 
@@ -159,7 +164,8 @@ class TestSeekTailCheckDetectsTruncation:
 
         # Write a valid tickfile first
         snap = _make_snapshot()
-        write_tickfile_rows(output_dir, minute_key, [("7203", snap, None)], 1)
+        write_tickfile_rows(output_dir, minute_key, [("7203", snap, None)], 1,
+                            enable_commit_marker=False)
         assert os.path.exists(path)
 
         # Corrupt the last line (truncate to < 65 fields)
@@ -171,7 +177,8 @@ class TestSeekTailCheckDetectsTruncation:
             f.write(corrupted)
 
         # Append should succeed and fix the truncation
-        write_tickfile_rows(output_dir, minute_key, [("7203", snap, None)], 2)
+        write_tickfile_rows(output_dir, minute_key, [("7203", snap, None)], 2,
+                            enable_commit_marker=False)
         with open(path, "r", encoding="utf-8") as f:
             result = f.read()
         # Should have header + 2 data rows
