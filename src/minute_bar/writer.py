@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from minute_bar.code_table import CodeTable
 from minute_bar.models import OHLCVAggregate, OrderRecord, SnapshotRecord
@@ -429,6 +429,30 @@ def write_tickfile_rows(
             "Tickfile: skipped %d/%d symbols for minute=%s",
             skipped, len(selected), minute_key,
         )
+
+
+def _parse_commit_line(line: str) -> Optional[Tuple[str, int, int, int]]:
+    """Parse a sidecar commit line `<minute>,<offset>,<rowcount>,<seqno>`.
+    Returns (minute, offset, rowcount, seqno) or None if invalid (partial/corrupt).
+    minute must be 12 digits; offset/rowcount/seqno non-negative ints."""
+    stripped = line.strip()
+    if not stripped:
+        return None
+    parts = stripped.split(",")
+    if len(parts) != 4:
+        return None
+    minute, offset_s, rowcount_s, seqno_s = parts
+    if len(minute) != 12 or not minute.isdigit():
+        return None
+    try:
+        offset = int(offset_s)
+        rowcount = int(rowcount_s)
+        seqno = int(seqno_s)
+    except ValueError:
+        return None
+    if offset < 0 or rowcount < 0 or seqno < 0:
+        return None
+    return (minute, offset, rowcount, seqno)
 
 
 def recover_tickfile_seqno(output_dir: str, minute_key: str) -> int:
