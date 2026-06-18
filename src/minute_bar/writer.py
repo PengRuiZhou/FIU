@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import sys
 import threading
 from typing import Dict, List, Optional, Tuple
 
@@ -13,9 +12,9 @@ try:
 except ImportError:
     _fcntl = None
     _HAS_FCNTL = False
-_IS_WINDOWS = sys.platform.startswith("win")
 
 from minute_bar.code_table import CodeTable
+from minute_bar.clock import extract_date_from_minute_key
 from minute_bar.models import OHLCVAggregate, OrderRecord, SnapshotRecord
 from minute_bar.tickfile import TICKFILE_HEADER, build_tickfile_row
 
@@ -608,6 +607,7 @@ def _sidecar_tail_last_record(sidecar_path: str, date: str):
             f.seek(-tail, 2)
             data = f.read()
     except OSError:
+        logger.warning("Sidecar tail read failed: %s", sidecar_path, exc_info=True)
         return None
     last = None
     for raw in reversed(data.split(b"\n")):
@@ -620,18 +620,14 @@ def _sidecar_tail_last_record(sidecar_path: str, date: str):
     return last
 
 
-def _date_from_minute_key(minute_key: str) -> str:
-    return minute_key[:8]
-
-
 def _classify_append_precondition(current_minute_key: str, sidecar_path: str, tickfile_path: str):
     """REGEN-GUARD predicate. Returns (kind, last_record):
       ("new", None)              — sidecar missing/empty -> first write of the day.
       ("committed", last_rec)    — sidecar last minute == current AND tickfile size == offset -> skip.
-      ("append", last_rec)       — last minute < current AND size == offset -> clean append.
+      ("append", last_rec)       — last minute <= current AND size <= offset -> clean append.
       ("truncate_rewrite", last_rec) — tickfile size > last offset -> uncommitted residue; truncate to offset then write.
     last_record = (minute, offset, rowcount, seqno) of sidecar's last valid line."""
-    last_rec = _sidecar_tail_last_record(sidecar_path, _date_from_minute_key(current_minute_key))
+    last_rec = _sidecar_tail_last_record(sidecar_path, extract_date_from_minute_key(current_minute_key))
     if last_rec is None:
         return ("new", None)
     last_minute, last_offset = last_rec[0], last_rec[1]
