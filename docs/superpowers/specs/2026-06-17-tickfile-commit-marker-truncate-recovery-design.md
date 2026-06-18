@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 20 轮 review 完成（10 组 × 2 轮），可进入 planning。
+> **Status**: 21 轮 review（+enable_tickfile 隔离/文件生命周期/plan 可操作性），待 Round 22 复审。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -415,6 +415,32 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 
 **M-R17-A7 — config 改动清单**
 - `config.py RecoveryConfig` 加 `enable_tickfile_commit_marker: bool = True`（L73 附近）+ `load_config` 加 `s.getboolean("enable_tickfile_commit_marker", ...)`（L160 附近）+ `production.ini` 等 7 个 ini 文件加 `[recovery] enable_tickfile_commit_marker = true`。
+
+### 3.12 Round 21 enable_tickfile 隔离 / 文件生命周期 / plan 可操作性（实施级增补）
+
+**C-R21-1 — enable_tickfile=false 时 recovery 误跑**
+- **INV-CM-RECOVERY-GATE**：`_recover_tickfile_to_last_commit` 的**所有调用点**（flusher `__init__` / replay `run()` / health-check / drain / cross-day pause）必须在 `if enable_tickfile:` gate 内。enable_tickfile=false 时整个 sidecar/flock/recovery 机制**零执行**。recovery 函数内部首行加防御 `if not enable_tickfile: return (set(), 0, False)`。write_tickfile_rows 的 flock/sidecar 不需单独 gate——传递性：`_try_generate_tickfile` 只在 enable_tickfile=True 时被调用。
+
+**C-R21-2 — 文件累积/retention**
+- **INV-CM-RETENTION**：`.truncated.*` 备份保留最近 7 天（`find output/tickfile -name '*.truncated.*' -mtime +7 -delete` cron 或 recovery 末尾清理最旧的 >10 份）。防止 disk-full cascade（C-R15-1）正反馈（备份加剧 disk-full → 更多 truncate → 更多备份）。
+- **INV-CM-AUDIT-ROTATION**：`tickfile_recovery.log` 须文档化 size 上限 + rotation（>10MB rename `.1` + 新建；或运维 logrotate 配置）。当前裸 `open("a")` 不受 logging handler rotation 管。
+
+**M-R21-1 — kill-switch 一致性**
+- **INV-CM-KILLSWITCH-CONSISTENCY**：`enable_tickfile_commit_marker` 是**进程级静态 flag**（`__init__` 读一次，运行期不可变；改需 restart）。`write_tickfile_rows` 与 `_recover_tickfile_to_last_commit` 读同一实例属性。commit-marker flag 仅在 enable_tickfile=True 时有意义。
+
+**M-R21-2 — 源码改动总表（plan Task 0）**
+- §3.12.1：按文件维度列改动清单（`writer.py` / `flusher.py` / `engine.py` / `replay.py` / `config.py`），每行 `| 文件 | 函数 | 改动 | 对应 INV | MVP/Full |`。
+
+**M-R21-3 — 实施 layer（plan Task 0）**
+- §3.12.2：TDD layer 化路径：
+  1. Layer 1（纯函数）：`_parse_commit_line` + `_classify_append_precondition` + 单测。
+  2. Layer 2（write）：`write_tickfile_rows` 加 flock+sidecar+REGEN-GUARD 四分支 + 单测。
+  3. Layer 3（recovery）：`_recover_tickfile_to_last_commit` + 单测。
+  4. Layer 4（集成）：flusher `__init__` + replay `run()` + 单测。
+  5. Layer 5（engine）：health-check/drain/pause 加 recovery + E2E。
+
+**M-R21-4 — INV 总表加实现类型列（plan Task 0）**
+- INV 总表（Mj-R13-1）加"实现类型"列：`code`（须代码实现）/ `doc`（注释/文档）/ `runbook`（运维流程）。
 
 ## 5. tail-check / newline-fix（sidecar 修订后：C1 自动消除）
 
