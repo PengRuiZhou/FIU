@@ -1280,3 +1280,31 @@ Minor：混存路径统一、FLOCK-LIFETIME 措辞"sidecar append"修正、HDD f
 
 ### Review log
 * `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
+
+---
+
+## Review Round 25（全新角度：错误消息/日志可操作性 + audit schema 与代码现实对齐）
+
+### 审核时间
+* 2026-06-18 14:00:00
+
+### 综合问题清单
+
+#### Critical
+| ID | 问题 | 决议 |
+| -- | ---- | ---- |
+| C-R25-1 | audit log `hostname` 字段在代码库无来源（grep 零命中 socket.gethostname），spec 把它当多机取证关键字段 | Accepted — §3.14 明确 hostname 来源 socket.gethostname() + 加入源码改动总表 |
+| C-R25-2 | audit log 路径 `output_dir/tickfile/tickfile_recovery.log` 首次创建时序：`__init__` recovery 早于 tickfile 数据写入 → 目录不存在 → audit 写失败被吞 → 首次 recovery 无 audit → tamper 检测无基准 | Accepted — §3.14 明确 recovery 自己 makedirs |
+
+#### Major
+| ID | 问题 | 决议 |
+| -- | ---- | ---- |
+| M-R25-1 | tamper 检测在"最需要它的窗口"（部署首日 fresh output_dir）正好失效（无 audit + 无 checkpoint + 有非平凡 tickfile → 无基准） | Accepted — §3.14 文档化首日 gap |
+| M-R25-2 | CRITICAL/ERROR 日志缺 minute/lockfile 上下文，运维无法定位 | Accepted — §3.14 INV-CM-LOG-CONTEXT |
+| M-R25-3 | 部署 runbook 只覆盖 Linux，spec 声明 Windows 支持（msvcrt）→ runbook vs 代码不一致 | Accepted — §3.14 收窄为"生产仅 Linux，Windows 仅测试" |
+| M-R25-4 | `result` 枚举三处不一致（truncate 在 M-R3-8 是合法值但 §3.10.2 告警规则不含 → truncate 静默） | Accepted — §3.14 统一枚举 + 告警规则 |
+
+Minor：日志关键字未固化为字面 grep token、降级 last_commit_minute 语义未定义、故障演练 4 验证步骤过度承诺。
+
+### Round 25 结论
+**3. 需要修改后进行 Round 26 复审。**（2 Critical + 4 Major。C-R25-1/2 让 audit log（唯一持久运维信号）在首次部署实际写不出来或字段残缺；M-R25-4 是 spec 内部直接矛盾——truncate 是合法 result 但告警规则不含 truncate。）

@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 24 轮 review 完成（12 组 × 2 轮），可进入 planning。
+> **Status**: 25 轮 review（+日志可操作性/audit schema 对齐），待 Round 26 复审。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -459,6 +459,33 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 
 **M-R23-3 — skip_fsync=True 下 INV-CM-MONO 落盘顺序弱化**
 - **INV-CM-SKIP-FSYNC-MONO-WEAKENED**：live 路径 `skip_fsync=True` 时 tickfile + sidecar 都不 fsync → INV-CM-MONO 的"sidecar 行落盘 ⟺ tickfile 数据完整落盘"降级为 **best-effort**：kernel page cache 决定落盘顺序，硬崩溃时 sidecar 可能先于 tickfile 落盘 → recovery 读到 sidecar 记录但 tickfile 该 offset 之后未落盘 → truncate 边界漂移。**接受此风险**（skip_fsync 路径本就是性能优先、牺牲崩溃一致性；与 order/snapshot 文件行为一致——它们在 `skip_fsync=True` 下也无 fsync）。audit log 记 `skip_fsync_mode=true` 标记。
+
+### 3.14 Round 25 日志可操作性 + audit schema 与代码现实对齐（运维级增补）
+
+> 前 24 轮覆盖"监控要有/metric 持久化/告警路由"，但无人核对过 audit JSON 每个字段在代码里从哪来、首次部署时目录存不存在、运维 grep 的 token 在 spec 里是不是字面量。
+
+**C-R25-1 — audit log `hostname` 字段在代码库无来源**
+- `grep -rn "hostname\|socket.gethostname" src/` 零命中。spec 把 hostname 当多机取证关键字段（§3.4/§3.7/§3.8 反复引用），但代码库从未读 hostname。
+- **修正**：`_recover_tickfile_to_last_commit` 新增 `import socket` + `hostname = socket.gethostname()` 填入 audit schema。空值语义：异常时写 `"unknown"`（不写 null/空串——避免 jq `.hostname` 过滤炸）。加入 §3.12.1 源码改动总表。
+
+**C-R25-2 — audit log 目录首次创建时序**
+- `_recover_tickfile_to_last_commit` 在 `flusher.__init__`（eager，INV-CM-ORDER-1）跑——**早于任何 tickfile 数据写入**。`output_dir/tickfile/` 目录可能还不存在（`write_tickfile_rows` 的 `os.makedirs` 只建嵌套 `{YYYY}/{MMDD}/`）。
+- **修正**：`_recover_tickfile_to_last_commit` 写 audit log 前**自己** `os.makedirs(os.path.join(output_dir, "tickfile"), exist_ok=True)`——**不依赖**数据写路径先建。与 INV-CM-AUDIT-BESTEFFORT 协同（makedirs 在 try/except 内，失败仍不阻断 recovery）。
+
+**M-R25-1 — tamper 检测首日 gap 文档化**
+- 首次部署 fresh output_dir（无 audit log + 无 checkpoint + 有非平凡 tickfile）= 无法区分"首次正常"与"sidecar 被删"。这是**已知 gap**（部署首日篡改不可检测）。spec 显式记录此 gap + 接受（首日后 audit log 建立基准 → tamper 检测有效）。
+
+**M-R25-2 — CRITICAL/ERROR 日志须带 minute 上下文**
+- **INV-CM-LOG-CONTEXT**：所有 CRITICAL/ERROR 级 tickfile 日志**必须**带 `minute` 或 `last_minute` 或 `lockfile` 上下文。`tickfile_writer_perm_dead` 至少带 `_tickfile_dequeue_count` + 队列最后未处理 minute（drain 时记下）。
+
+**M-R25-3 — Windows 适用范围收窄**
+- spec §3.2 M-R5-5（truncate-before-open for win32）+ M-R15-2（fs runtime check Windows）声明 Windows 支持。但 §3.10.1 部署 runbook 只给 Linux 命令。
+- **收窄**：commit-marker 机制**生产部署仅 Linux**（ext4/xfs + fcntl.flock + /proc/mounts）。Windows 仅开发/测试（msvcrt.locking 可用但非生产路径）。§3.10.1 runbook 明确声明。
+
+**M-R25-4 — `result` 枚举统一 + 告警规则修正**
+- 统一枚举：`truncate | noop | fallback | error | tamper`（把 tamper 纳入枚举）。
+- **§3.10.2 所有监控告警规则**的过滤集统一为 `truncate|fallback|error|tamper`（之前 §3.10.2 cron grep 漏 truncate → 截断静默不告警——spec 内部直接矛盾已修）。
+- 降级时 `last_commit_minute=null` + 新增 `fallback_mode=true` 字段（区别正常首跑）。
 
 ## 5. tail-check / newline-fix（sidecar 修订后：C1 自动消除）
 
