@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -483,7 +484,8 @@ def _parse_commit_line(line: str) -> Optional[Tuple[str, int, int, int]]:
 
 
 def recover_tickfile_seqno(output_dir: str, minute_key: str) -> int:
-    """Thin wrapper (deprecated by sidecar recovery; kept for back-compat). Returns last seqno."""
+    """Returns the maximum valid seqno (callers seed max+1). Thin wrapper (deprecated by
+    sidecar recovery; kept for back-compat)."""
     path = get_tickfile_path(output_dir, minute_key)
     if not os.path.exists(path):
         return 0
@@ -493,7 +495,7 @@ def recover_tickfile_seqno(output_dir: str, minute_key: str) -> int:
         return 0
 
 
-def _scan_tickfile_rows(path: str):
+def _scan_tickfile_rows(path: str) -> Tuple[set, int]:
     """Single-pass row scan (M-R23-2): returns (minute_set, last_seqno) from a tickfile.
     Reads UpdateTime (col 16) + Seqno (col 59); skips header + non-65-field lines."""
     minutes: set = set()
@@ -522,12 +524,11 @@ class _FallbackSignal(Exception):
 
 def _backup_truncated_tail(tickfile_path: str, offset: int, old_size: int) -> bool:
     """Copy [offset, old_size) to a .truncated.{time_ns}.{pid} file. Returns False on IO failure."""
-    import time as _time
     try:
         with open(tickfile_path, "rb") as f:
             f.seek(offset)
             tail = f.read(old_size - offset)
-        backup_path = f"{tickfile_path}.truncated.{_time.time_ns()}.{os.getpid()}"
+        backup_path = f"{tickfile_path}.truncated.{time.time_ns()}.{os.getpid()}"
         with open(backup_path, "wb") as bf:
             bf.write(tail)
             bf.flush()
@@ -570,15 +571,15 @@ def _tail_strip_partial_last_line(tickfile_path: str) -> int:
     return 0
 
 
-def _write_recovery_audit(output_dir, date, *, had_sidecar, committed_count,
-                          last_commit_minute, truncate_bytes, result, fallback_mode=False):
+def _write_recovery_audit(output_dir: str, date: str, *, had_sidecar: bool, committed_count: int,
+                          last_commit_minute: Optional[str], truncate_bytes: int, result: str,
+                          fallback_mode: bool = False) -> None:
     """Best-effort persistent audit log (INV-CM-AUDIT-BESTEFFORT). Never raises."""
     try:
-        import time as _time
         log_dir = os.path.join(output_dir, "tickfile")
         os.makedirs(log_dir, exist_ok=True)  # C-R25-2: self-create, don't rely on data path
         rec = {
-            "ts": _time.time(),
+            "ts": time.time(),
             "date": date,
             "pid": os.getpid(),
             "hostname": socket.gethostname() or "unknown",
