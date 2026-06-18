@@ -355,7 +355,8 @@ def write_tickfile_rows(
 
     with _get_write_lock(path):  # in-process RLock (INV-CM-LOCK)
         flock_cm = _flock_critical_section(lockfile_path) if enable_commit_marker else _nullctx()
-        with flock_cm:  # cross-process (INV-CM-SIDECAR-IN-LOCK / FLOCK-WITH-NESTED)
+        with flock_cm:  # cross-process flock (INV-CM-SIDECAR-IN-LOCK / FLOCK-WITH-NESTED);
+                        # on non-POSIX dev/test flock is a no-op, so concurrency relies on _get_write_lock above
             content = TICKFILE_HEADER + "\n" + "\n".join(rows) + "\n"
 
             if enable_commit_marker:
@@ -651,7 +652,12 @@ def _classify_append_precondition(current_minute_key: str, sidecar_path: str, ti
             return ("committed", last_rec)
         if size > last_offset:
             return ("truncate_rewrite", last_rec)
-        return ("committed", last_rec)  # size < offset anomaly -> treat as committed (don't double-write)
+        logger.warning(
+            "Tickfile size %d < sidecar offset %d (anomaly; possible truncation/tamper) minute=%s; "
+            "skipping to avoid double-write",
+            size, last_offset, current_minute_key,
+        )
+        return ("committed", last_rec)
     # last_minute < current (normal) — or > current (anomaly)
     if last_minute > current_minute_key:
         logger.warning("Sidecar last minute %s > current %s (anomaly); treating as append",
