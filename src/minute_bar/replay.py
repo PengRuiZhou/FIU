@@ -79,17 +79,33 @@ class ReplayEngine:
             first_seen_volume_base=self._config.aggregation.first_seen_volume_base
         )
 
-        # Part 2 (stale-fix): learn which minutes are already in the output tickfile so we
-        # skip them (fill only gaps). No-op when no tickfile exists (pure replay).
+        # Part 2 (stale-fix) + commit-marker (T6): learn which minutes are already
+        # COMMITTED in the output tickfile so we skip them (fill only gaps). When a
+        # sidecar commit file exists it is authoritative and the tickfile is truncated
+        # to the last committed offset (drops partial mid-append tails + un-sidecared
+        # stale rows). Falls back to a row scan when there is no sidecar or recovery
+        # raises. No-op when no tickfile exists (pure replay).
         if self._enable_tickfile:
-            self._generated_tickfile_minutes = self._scan_generated_tickfile_minutes(
-                self._config.output.output_dir
-            )
+            from minute_bar.writer import _recover_tickfile_to_last_commit
+            try:
+                committed_set, last_seqno, had_sidecar = _recover_tickfile_to_last_commit(
+                    self._config.output.output_dir, self._date,
+                    enable_commit_marker=self._config.recovery.enable_tickfile_commit_marker)
+            except Exception:
+                logger.exception("Replay tickfile recovery failed; falling back to row scan")
+                committed_set, last_seqno, had_sidecar = self._scan_generated_tickfile_minutes(
+                    self._config.output.output_dir), 0, False
+            if had_sidecar or committed_set:
+                # sidecar authoritative OR fallback row-scan already populated committed_set
+                self._generated_tickfile_minutes = committed_set
+            else:
+                # legacy fallback (no sidecar, empty) -> scan
+                self._generated_tickfile_minutes = self._scan_generated_tickfile_minutes(
+                    self._config.output.output_dir)
+            self._tickfile_seqno = max(self._tickfile_seqno, last_seqno)  # INV-CM-SEQNO-MONO-FILE
             if self._generated_tickfile_minutes:
-                logger.info(
-                    "Replay: %d tickfile minutes already present — will skip, fill only gaps",
-                    len(self._generated_tickfile_minutes),
-                )
+                logger.info("Replay: %d tickfile minutes committed (had_sidecar=%s) — fill only gaps",
+                            len(self._generated_tickfile_minutes), had_sidecar)
 
         write_executor = ThreadPoolExecutor(max_workers=2)
 
@@ -283,25 +299,26 @@ class ReplayEngine:
             self._state.raw_snapshot_buffers.pop(minute_key, None)
 
         if self._enable_tickfile:
-            # Part 2 (stale-fix): skip minutes already present in the output tickfile
-            # (fill only gaps; do not duplicate/corrupt correct rows). Check BEFORE seqno
-            # increment so skipped minutes do not burn seqno numbers.
+            # Part 2 (stale-fix) + commit-marker (T6): skip minutes already COMMITTED
+            # in the output tickfile (fill only gaps; do not duplicate/corrupt rows).
+            # Check BEFORE seqno increment so skipped minutes do not burn seqno numbers.
+            # Seqno is now seeded once at run() start from sidecar recovery (no lazy
+            # per-minute file scan); INV-CM-SEQNO-MONO-FILE.
             if minute_key in self._generated_tickfile_minutes:
                 logger.debug("Replay skip already-generated tickfile minute=%s", minute_key)
             else:
-                from minute_bar.writer import get_tickfile_path, recover_tickfile_seqno, write_tickfile_rows
+                from minute_bar.writer import write_tickfile_rows
                 from minute_bar.tickfile import select_tickfile_records
-                path = get_tickfile_path(output_dir, minute_key)
-                if self._tickfile_seqno == 0 and os.path.exists(path):
-                    self._tickfile_seqno = recover_tickfile_seqno(output_dir, minute_key)
                 self._tickfile_seqno += 1
+                current_seqno = self._tickfile_seqno
                 with self._state.lock:
                     order_records = self._state.raw_order_buffers.pop(minute_key, [])
                     latest_order_copy = dict(self._state.latest_order_by_symbol)
                 code_getter = (lambda symbol, t=self._code_table: t.table.get(symbol)) if self._code_table else None
                 selected = select_tickfile_records(raw_records, snapshot_copy, order_records, latest_order_copy)
-                write_tickfile_rows(output_dir, minute_key, selected, self._tickfile_seqno,
-                                    code_table_getter=code_getter, skip_fsync=False)
+                write_tickfile_rows(output_dir, minute_key, selected, current_seqno,
+                                    code_table_getter=code_getter, skip_fsync=False,
+                                    enable_commit_marker=self._config.recovery.enable_tickfile_commit_marker)
                 self._generated_tickfile_minutes.add(minute_key)
 
         logger.info(

@@ -305,3 +305,90 @@ class TestReplayZeroDataLoss:
             summary = json.load(f)
         assert "late_snapshot_records" in summary
         assert summary["late_snapshot_records"] >= 0
+
+
+def test_replay_uses_sidecar_recovery_not_scan(tmp_path):
+    """INV-CM-REPLAY-SCAN-REPLACED: replay populates the skip-set from sidecar
+    recovery (NOT a row scan), so an un-sidecared 0932 row is treated as a gap and
+    regenerated, and a partial mid-append tail is truncated. With the old scan path
+    the un-sidecared 0932 row would be picked up and the minute skipped (stale)."""
+    from minute_bar.tickfile import TICKFILE_HEADER
+    from minute_bar.writer import get_tickfile_path
+
+    date = "20260520"
+    out = tmp_path / "output"
+    out.mkdir()
+    inp = tmp_path / "input"
+    inp.mkdir()
+    (inp / f"code.csv.{date}").write_text(
+        "7203,1,TSE,Toyota,JPY,equity,common,,,,0,0,0,2,0,,0\n", encoding="utf-8")
+    # Snapshot rows: clock-minute 0930 -> bucket 0931 (committed/seeded);
+    # clock-minute 0931 -> bucket 0932 (gap to regenerate). Proven round-up pattern
+    # from tests/test_tickfile_stale_fix.py:197.
+    (inp / f"snapshot.csv.{date}").write_text(
+        "7203,20260520093000999,443500,450000,440000,451000,443500,450000,450000,100,100,45000000,1,,T,0,Y,2,0,0,20260520083000999\n"
+        "7203,20260520093100999,443500,455000,440000,455000,443500,455000,455000,100,300,135000000,1,,T,0,Y,2,0,0,20260520083100999\n",
+        encoding="utf-8")
+
+    # Pre-seed the per-day tickfile: committed bucket 0931 (valid 65-field row,
+    # sidecar entry present) + a STALE un-sidecared 0932 row (valid 65 fields but
+    # NO sidecar entry — simulates a previous crash mid-minute) + a partial tail.
+    # Under sidecar recovery: committed_set={0931}, the stale 0932 row is ignored,
+    # and the file is truncated to the 0931 commit offset before 0932 regenerates.
+    # Under the old row-scan: both 0931 and 0932 would be picked up -> 0932 skipped.
+    tf = get_tickfile_path(str(out), f"{date}0931")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    fields = [""] * 65
+    fields[0] = "7203"; fields[1] = date
+    fields[16] = f"{date} 09:31:00"   # UpdateTime -> minute_key 202605200931
+    fields[59] = "1"                   # Seqno
+    fields[60] = "2026-05-20 09:30:00.999000"  # LocalTime
+    committed_row = ",".join(fields)
+    committed = TICKFILE_HEADER + "\n" + committed_row + "\n"
+    committed_bytes = committed.encode("utf-8")
+    # Stale un-sidecared 0932 row (valid 65 fields) — would fool a row scan.
+    stale_fields = list(fields)
+    stale_fields[16] = f"{date} 09:32:00"
+    stale_fields[59] = "2"
+    stale_fields[60] = "2026-05-20 09:31:00.999000"
+    stale_row = ",".join(stale_fields)
+    with open(tf, "wb") as f:
+        f.write(committed_bytes)
+        f.write(stale_row.encode("utf-8") + b"\n")
+        f.write(b"7203,partial,corrupt,tail\n")   # partial mid-append tail (no sidecar)
+    # Sidecar records ONLY the committed 0931 at offset = len(committed_bytes).
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,{len(committed_bytes)},1,1\n")
+
+    cfg = AppConfig(
+        input=InputConfig(csv_dir=str(inp), file_encoding="utf-8"),
+        output=OutputConfig(output_dir=str(out), enable_order=False,
+                            enable_tickfile=True, enable_kline=False),
+        aggregation=AggregationConfig(first_seen_volume_base="start_totalvol"),
+    )
+    engine = ReplayEngine(cfg, date=date)
+    engine.run()
+
+    # Sidecar authoritative -> committed_set={0931} only. Stale 0932 + partial tail
+    # truncated; 0932 regenerated fresh; 0931 not duplicated.
+    data = open(tf, "rb").read()
+    assert b"partial,corrupt" not in data, "partial tail was not truncated by sidecar recovery"
+    with open(tf, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader)  # header
+        by_min = {}
+        stale_local_times = []   # collect LocalTime (col 60) for 0932 rows
+        for row in reader:
+            if len(row) != 65:
+                continue
+            mk = row[16].replace(" ", "").replace(":", "")[:12]
+            by_min[mk] = by_min.get(mk, 0) + 1
+            if mk == f"{date}0932":
+                stale_local_times.append(row[60])
+    assert by_min.get(f"{date}0931", 0) == 1, "committed 0931 was duplicated"
+    assert by_min.get(f"{date}0932", 0) == 1, "gap 0932 was not regenerated cleanly"
+    # The regenerated 0932 row must come from THIS run (LocalTime ~= 09:30/09:31),
+    # not the stale seed (LocalTime 09:31:00.999000 would survive under scan path).
+    # Under recovery the stale row is truncated before regeneration, so exactly one
+    # fresh 0932 row remains.
+    assert len(stale_local_times) == 1, "0932 should have exactly one (regenerated) row"
