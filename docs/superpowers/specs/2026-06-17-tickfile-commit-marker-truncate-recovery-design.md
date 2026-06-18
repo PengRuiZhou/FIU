@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 22 轮 review 完成（11 组 × 2 轮），可进入 planning。
+> **Status**: 23 轮 review（+REGEN truncate flock/cross-day forcegen/skip_fsync MONO），待 Round 24 复审。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -441,6 +441,24 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 
 **M-R21-4 — INV 总表加实现类型列（plan Task 0）**
 - INV 总表（Mj-R13-1）加"实现类型"列：`code`（须代码实现）/ `doc`（注释/文档）/ `runbook`（运维流程）。
+
+### 3.13 Round 23 全新视角终审（REGEN truncate flock 覆盖 / cross-day force-gen 失败 / skip_fsync MONO 弱化）
+
+**C-R23-1 — REGEN-GUARD 分支 1b/2b truncate 须在 flock 临界区内**
+- **INV-CM-FLOCK-COVERS-REGEN-TRUNCATE**：REGEN-GUARD 分支 1b（size>offset → truncate+重写）/ 2b（size>offset → truncate+重写）的 `os.truncate(path)` 必须**在 flock 临界区内**（flock 临界区 ⊇ `_get_write_lock` 临界区 ⊇ truncate+append）。当前 INV-CM-FLOCK-WITH-NESTED（§3.11）覆盖 append 但未显式覆盖 truncate——补覆盖。否则跨进程 live+replay 同文件时 recovery truncate 与本进程 REGEN truncate 交错 → 损坏。
+
+**C-R23-2 — cross-day force-gen 失败分钟数据丢失**
+- **场景**：`_step1_cross_day_check` force-gen（L237-239）调 `_try_generate_tickfile` 失败（IOError）→ except 块（L240-241）仅 `logger.exception`（不 re-insert / 不 retry，与 `_tickfile_writer_loop` 不同）→ 该分钟 partial rows 留旧日 tickfile（sidecar 未记录）→ recovery（L252 后）truncate 掉 → **该分钟数据丢失**（pending 已 pop，recovery 不重生成）。
+- **INV-CM-CROSSDAY-FORCEGEN-RETRY**：cross-day force-gen 失败的分钟须在 clear 前 **retry 一次**（或纳入 recovery 后的 reconcile 注入 gap 补齐）。`_step1` 的 except 块须与 `_tickfile_writer_loop` 一致：失败 re-insert + retry 一次；二次失败则 CRITICAL + Fix-G CHECK 照常 fire。测试 `test_crossday_forcegen_failure_minute_not_lost`。
+
+**M-R23-1 — cross-day recovery 旧日 committed_set 不写 live skip-set**
+- **INV-CM-CROSSDAY-COMMITTED-DISCARD**：cross-day recovery（INV-CM-CROSSDAY-FLUSH-BARRIER）返回的旧日 `committed_set` **仅用于旧日 sidecar 一致性 + audit**，**不写** `_state._generated_tickfile_minutes`（live skip-set）。写入会污染跨日 reconcile（committed_set 含跨日分钟）。
+
+**M-R23-2 — 降级路径单次扫描合并**
+- `had_sidecar=False` 降级路径须**单次**扫描 tickfile 同时产出 `committed_set`（UpdateTime 提取）+ `last_seqno`（fields[59] 提取），合并 `_extract_minutes_from_tickfile` 与 `recover_tickfile_seqno` 的逻辑到一个循环。禁止扫两次（1.5M 行 × 2 = 慢）。
+
+**M-R23-3 — skip_fsync=True 下 INV-CM-MONO 落盘顺序弱化**
+- **INV-CM-SKIP-FSYNC-MONO-WEAKENED**：live 路径 `skip_fsync=True` 时 tickfile + sidecar 都不 fsync → INV-CM-MONO 的"sidecar 行落盘 ⟺ tickfile 数据完整落盘"降级为 **best-effort**：kernel page cache 决定落盘顺序，硬崩溃时 sidecar 可能先于 tickfile 落盘 → recovery 读到 sidecar 记录但 tickfile 该 offset 之后未落盘 → truncate 边界漂移。**接受此风险**（skip_fsync 路径本就是性能优先、牺牲崩溃一致性；与 order/snapshot 文件行为一致——它们在 `skip_fsync=True` 下也无 fsync）。audit log 记 `skip_fsync_mode=true` 标记。
 
 ## 5. tail-check / newline-fix（sidecar 修订后：C1 自动消除）
 
