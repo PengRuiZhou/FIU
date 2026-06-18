@@ -240,3 +240,100 @@ def test_run_tickfile_recovery_truncates_and_syncs_state(tmp_path):
     assert os.path.getsize(tf) == len(committed.encode())  # truncated again
     assert f"{date}0931" in state._generated_tickfile_minutes
     assert state._tickfile_seqno == 7
+
+
+class TestReconcileTickfile:
+    """INV-CM-RECONCILE-THREE-WAY: detection-only three-way reconcile
+    (tickfile ↔ snapshot/order). Gap-injection is DEFERRED.
+
+    Each test constructs the flusher with an empty SharedState (so the init-time
+    reconcile sees an empty reference and is a no-op), then seeds the snapshot/order
+    minute-sets and calls _reconcile_tickfile explicitly. This isolates the assertion
+    to the explicit call rather than init-time recovery noise."""
+
+    def test_reconcile_logs_critical_for_missing_tickfile_minute(self, tmp_path, caplog):
+        """Snapshot has a minute tickfile lacks -> CRITICAL 'MISSING from tickfile'."""
+        import logging
+        from tests.test_tickfile_sync import _make_flusher
+
+        state = SharedState()
+        state.first_data_received = True
+        flusher = _make_flusher(state, tmp_path, enable_tickfile=True)
+        # Snapshot leg has 0931 + 0932; tickfile only has 0931 → 0932 is missing.
+        state.flushed_snapshot_minutes = {"202606020931", "202606020932"}
+        caplog.clear()
+        with caplog.at_level(logging.CRITICAL, logger="minute_bar.flusher"):
+            flusher._reconcile_tickfile({"202606020931"})
+        assert any("MISSING from tickfile" in r.message for r in caplog.records)
+
+    def test_reconcile_logs_critical_for_tickfile_only_minute(self, tmp_path, caplog):
+        """Tickfile has a minute snapshot/order lack -> CRITICAL 'NOT in snapshot/order'."""
+        import logging
+        from tests.test_tickfile_sync import _make_flusher
+
+        state = SharedState()
+        state.first_data_received = True
+        flusher = _make_flusher(state, tmp_path, enable_tickfile=True)
+        state.flushed_snapshot_minutes = {"202606020931"}
+        caplog.clear()
+        with caplog.at_level(logging.CRITICAL, logger="minute_bar.flusher"):
+            # tickfile has 0931 + 0933; snapshot only has 0931 → 0933 is tickfile-only.
+            flusher._reconcile_tickfile({"202606020931", "202606020933"})
+        assert any("NOT in snapshot/order" in r.message for r in caplog.records)
+
+    def test_reconcile_no_log_when_consistent(self, tmp_path, caplog):
+        """Snapshot and tickfile agree on the same minute set -> no CRITICAL."""
+        import logging
+        from tests.test_tickfile_sync import _make_flusher
+
+        state = SharedState()
+        state.first_data_received = True
+        flusher = _make_flusher(state, tmp_path, enable_tickfile=True)
+        state.flushed_snapshot_minutes = {"202606020931"}
+        caplog.clear()
+        with caplog.at_level(logging.CRITICAL, logger="minute_bar.flusher"):
+            flusher._reconcile_tickfile({"202606020931"})  # consistent
+        assert not any("tickfile_reconcile" in r.message for r in caplog.records)
+
+    def test_reconcile_noop_when_no_reference(self, tmp_path, caplog):
+        """Empty snapshot/order legs (fresh run) -> reconcile is a no-op, no CRITICAL."""
+        import logging
+        from tests.test_tickfile_sync import _make_flusher
+
+        state = SharedState()
+        flusher = _make_flusher(state, tmp_path, enable_tickfile=True)
+        caplog.clear()
+        with caplog.at_level(logging.CRITICAL, logger="minute_bar.flusher"):
+            flusher._reconcile_tickfile({"202606020931"})
+        assert not any("tickfile_reconcile" in r.message for r in caplog.records)
+
+    def test_reconcile_noop_when_tickfile_disabled(self, tmp_path, caplog):
+        """enable_tickfile=False -> reconcile returns immediately, no CRITICAL."""
+        import logging
+        from tests.test_tickfile_sync import _make_flusher
+
+        state = SharedState()
+        state.first_data_received = True
+        flusher = _make_flusher(state, tmp_path, enable_tickfile=False)
+        state.flushed_snapshot_minutes = {"202606020931"}
+        caplog.clear()
+        with caplog.at_level(logging.CRITICAL, logger="minute_bar.flusher"):
+            flusher._reconcile_tickfile(set())
+        assert not any("tickfile_reconcile" in r.message for r in caplog.records)
+
+    def test_reconcile_uses_order_leg(self, tmp_path, caplog):
+        """Order-only minute (not in snapshot, not in tickfile) -> CRITICAL missing."""
+        import logging
+        from tests.test_tickfile_sync import _make_flusher
+
+        state = SharedState()
+        state.first_data_received = True
+        flusher = _make_flusher(state, tmp_path, enable_tickfile=True)
+        # Order leg has 0934 that tickfile lacks.
+        state.flushed_order_minutes = {"202606020934"}
+        caplog.clear()
+        with caplog.at_level(logging.CRITICAL, logger="minute_bar.flusher"):
+            flusher._reconcile_tickfile({"202606020931"})
+        assert any("MISSING from tickfile" in r.message for r in caplog.records)
+
+

@@ -100,6 +100,8 @@ class ClockWatermarkFlusher:
                                len(committed_set))
             # INV-CM-SEQNO-MONO-FILE: never regress.
             self._state._tickfile_seqno = max(self._state._tickfile_seqno, last_seqno)
+            # INV-CM-RECONCILE-THREE-WAY: detection only (gap-injection deferred).
+            self._reconcile_tickfile(committed_set)
 
         self._tickfile_queue: Optional[_queue_module.Queue] = None  # Set by Engine.start()
         self._engine_ref = None  # Set by Engine.__init__
@@ -610,6 +612,66 @@ class ClockWatermarkFlusher:
             with self._state.lock:
                 self._state._generated_tickfile_minutes |= committed_set
                 self._state._tickfile_seqno = max(self._state._tickfile_seqno, last_seqno)
+        # INV-CM-RECONCILE-THREE-WAY: detection only (gap-injection deferred).
+        # Run regardless of had_sidecar/committed_set so an empty tickfile vs.
+        # non-empty snapshot/order is also caught.
+        self._reconcile_tickfile(committed_set)
+
+    def _reconcile_tickfile(self, committed_set: set) -> None:
+        """INV-CM-RECONCILE-THREE-WAY (detection only; gap-injection deferred to follow-up).
+
+        Compares tickfile committed minutes (from sidecar/row-scan recovery) against
+        snapshot/order minute-sets and CRITICAL-logs discrepancies. Best-effort — never
+        raises, since recovery must not be blocked by reconcile.
+
+        Three legs compared:
+          - tickfile  : committed_set (minutes physically present in tickfile sidecar)
+          - snapshot  : self._state.flushed_snapshot_minutes  (runtime) ∪
+                        self._state.output_minutes            (checkpointed snapshot output)
+          - order     : self._state.flushed_order_minutes     (runtime order-file set)
+
+        Discrepancy meanings:
+          - tickfile_missing = a minute present in snapshot/order but absent from tickfile.
+            Recovery signal: that minute will need gap-injection regeneration (deferred).
+          - tickfile_only    = a minute present in tickfile but absent from snapshot/order.
+            Checkpoint/order-bookkeeping bug signal.
+
+        NOTE: At init-time recovery, flushed_snapshot_minutes/flushed_order_minutes may not
+        yet be populated (they are restored by Engine._restore_from_checkpoint after the
+        flusher is constructed). In that case reference is empty and reconcile is a no-op;
+        the snapshot/order legs become meaningful on the runtime recovery path
+        (_run_tickfile_recovery) and during live operation. Gap-injection (actually
+        regenerating the missing tickfile minutes) is explicitly DEFERRED per the
+        commit-marker plan.
+        """
+        if not self._enable_tickfile:
+            return
+        try:
+            with self._state.lock:
+                snapshot_minutes = set(getattr(self._state, "flushed_snapshot_minutes", None) or set())
+                output_minutes = set(getattr(self._state, "output_minutes", None) or set())
+                order_minutes = set(getattr(self._state, "flushed_order_minutes", None) or set())
+            reference = snapshot_minutes | output_minutes | order_minutes
+            if not reference:
+                # Nothing to compare against (fresh run / no checkpoint restored yet).
+                return
+            committed = set(committed_set or set())
+            tickfile_missing = reference - committed
+            tickfile_only = committed - reference
+            if tickfile_missing:
+                logger.critical(
+                    "tickfile_reconcile: %d minutes present in snapshot/order but MISSING from tickfile "
+                    "(will be regenerated as gaps): %s",
+                    len(tickfile_missing), sorted(tickfile_missing)[:20],
+                )
+            if tickfile_only:
+                logger.critical(
+                    "tickfile_reconcile: %d minutes present in tickfile but NOT in snapshot/order "
+                    "(checkpoint/order bug signal): %s",
+                    len(tickfile_only), sorted(tickfile_only)[:20],
+                )
+        except Exception:
+            logger.debug("tickfile reconcile failed (best-effort)", exc_info=True)
 
     def _try_generate_tickfile(self, minute_key: str) -> None:
         """Generate tickfile for a minute. Thread-safe. Callable from any thread.
