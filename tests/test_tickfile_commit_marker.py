@@ -954,3 +954,31 @@ def test_fs_check_noop_when_fcntl_unavailable(tmp_path):
     assert W._HAS_FCNTL is False
     W.check_output_fs_local(str(tmp_path))   # must not raise
 
+
+def test_crossday_old_date_recovery_truncates_partial(tmp_path):
+    """INV-CM-CROSSDAY-FLUSH-BARRIER: recovering the OLD date at cross-day truncates its partial tail.
+
+    The cross-day pause's _run_tickfile_recovery() resolves the date via jst_now_yyyymmdd() = the NEW
+    date, so the OLD-date partial tail was never truncated. _step1_cross_day_check therefore makes an
+    explicit old-date _recover_tickfile_to_last_commit call before clearing state. This test mirrors
+    that exact call and asserts the old-date partial is truncated (and the returned set is discarded)."""
+    import os
+    from minute_bar.writer import _recover_tickfile_to_last_commit, get_tickfile_path
+    old_date = "20260527"  # the day being crossed away from
+    tf = get_tickfile_path(str(tmp_path), f"{old_date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed = TICKFILE_HEADER + "\n" + ("a" * 60) + "\n"
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + b"OLD_DATE_PARTIAL_TAIL")
+    committed_off = len(committed.encode())
+    with open(tf + ".commit", "w") as f:
+        # last old-date minute committed; offset = end of committed content
+        f.write(f"{old_date}1500,{committed_off},1,330\n")
+    # Mirrors the fix's call: result is discarded (INV-CM-CROSSDAY-COMMITTED-DISCARD).
+    cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), old_date, enable_commit_marker=True)
+    assert had is True
+    assert f"{old_date}1500" in cset
+    assert seq == 330
+    assert os.path.getsize(tf) == committed_off          # old-date partial truncated
+    assert b"OLD_DATE_PARTIAL_TAIL" not in open(tf, "rb").read()
+

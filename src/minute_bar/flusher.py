@@ -272,6 +272,22 @@ class ClockWatermarkFlusher:
                 len(remaining), sorted(remaining)[:20],
             )
 
+        # INV-CM-CROSSDAY-FLUSH-BARRIER: recover the OLD date's tickfile (truncate any partial tail
+        # the writer left) before clearing state. The T7 pause's _run_tickfile_recovery() resolved its
+        # date via jst_now_yyyymmdd() = the NEW date, so the OLD-date partial tail was never truncated.
+        # Discard the returned set (INV-CM-CROSSDAY-COMMITTED-DISCARD: old-date minutes must NOT enter
+        # the live skip-set; we only want the truncate + audit side-effect). Best-effort — never block.
+        old_date = self._state.last_output_date
+        if old_date and old_date != current_date:
+            from minute_bar.writer import _recover_tickfile_to_last_commit
+            try:
+                _recover_tickfile_to_last_commit(
+                    self._output_dir, old_date,
+                    enable_commit_marker=self._enable_tickfile_commit_marker,
+                )
+            except Exception:
+                logger.exception("Cross-day old-date tickfile recovery failed for date=%s", old_date)
+
         cleared_pending = 0
         with self._state.lock:
             self._state.output_minutes.clear()
