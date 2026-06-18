@@ -182,3 +182,28 @@ class TestStep5WriteCheckpoint:
         flusher._step5_write_checkpoint()
 
         assert os.path.exists(str(tmp_path / "checkpoint.json"))
+
+
+def test_flusher_init_runs_recovery_and_populates_skipset(tmp_path):
+    """INV-CM-ORDER-1: __init__ recovery replaces eager seqno; populates skip-set; truncates partial."""
+    import os
+    from minute_bar.aggregator import SharedState
+    from minute_bar.tickfile import TICKFILE_HEADER
+    from minute_bar.writer import get_tickfile_path
+    from tests.test_tickfile_sync import _make_flusher
+
+    state = SharedState()
+    state.first_data_received = True
+    date = "20260602"  # matches the jst_now patch inside _make_flusher
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed = TICKFILE_HEADER + "\n" + ("a" * 60) + "\n"
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + b"PARTIAL_TAIL")
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,{len(committed.encode())},1,9\n")
+
+    flusher = _make_flusher(state, tmp_path, enable_tickfile=True)
+    assert os.path.getsize(tf) == len(committed.encode())  # truncated
+    assert f"{date}0931" in state._generated_tickfile_minutes
+    assert state._tickfile_seqno == 9

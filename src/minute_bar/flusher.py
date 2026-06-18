@@ -36,19 +36,6 @@ _TICKFILE_QUEUE_WARNING_THRESHOLD = 500
 _TICKFILE_QUEUE_CRITICAL_THRESHOLD = 800
 
 
-def recover_tickfile_seqno_lazy(output_dir: str, date: str) -> int:
-    """Recover seqno from existing tickfile for a specific date. Returns 0 if no file found.
-    Called once at startup, before any threads start.
-    """
-    from minute_bar.writer import recover_tickfile_seqno
-    sample_minute_key = f"{date}0800"
-    try:
-        return recover_tickfile_seqno(output_dir, sample_minute_key)
-    except Exception:
-        logger.warning("Failed to recover tickfile seqno for date=%s", date)
-        return 0
-
-
 class ClockWatermarkFlusher:
     def __init__(
         self,
@@ -67,6 +54,7 @@ class ClockWatermarkFlusher:
         enable_time_fallback: bool = True,
         stall_flush_sec: int = 300,
         enable_tickfile: bool = False,
+        enable_tickfile_commit_marker: bool = True,
     ):
         self._state = state
         self._code_table = code_table
@@ -90,12 +78,28 @@ class ClockWatermarkFlusher:
 
         # Tickfile state
         self._enable_tickfile = enable_tickfile
+        # INV-CM-KILLSWITCH-CONSISTENCY: process-static flag, read once.
+        self._enable_tickfile_commit_marker = enable_tickfile_commit_marker
         if enable_tickfile:
             if not self._enable_order:
                 raise ValueError("enable_tickfile=True requires enable_order=True")
-            # Recover seqno from existing tickfile (single-threaded, before engine.start())
+            # Recovery = single source of truth for seqno + skip-set (INV-CM-ORDER-1/2).
+            # Runs eagerly in __init__, before any writer thread starts.
+            from minute_bar.writer import _recover_tickfile_to_last_commit
             target_date = jst_now_yyyymmdd()
-            self._state._tickfile_seqno = recover_tickfile_seqno_lazy(output_dir, target_date)
+            try:
+                committed_set, last_seqno, had_sidecar = _recover_tickfile_to_last_commit(
+                    output_dir, target_date, enable_commit_marker=self._enable_tickfile_commit_marker)
+            except Exception:
+                logger.exception("Tickfile recovery failed at init; degrading to empty skip-set")
+                committed_set, last_seqno, had_sidecar = set(), 0, False
+            # INV-CM-SKIPSET-LIVE-FALLBACK: sidecar mode OR fallback row-scan both populate committed_set.
+            self._state._generated_tickfile_minutes |= committed_set
+            if (not had_sidecar) and committed_set:
+                logger.warning("live_skipset_reconstructed_from_rows: %d minutes (had_sidecar=False)",
+                               len(committed_set))
+            # INV-CM-SEQNO-MONO-FILE: never regress.
+            self._state._tickfile_seqno = max(self._state._tickfile_seqno, last_seqno)
 
         self._tickfile_queue: Optional[_queue_module.Queue] = None  # Set by Engine.start()
         self._engine_ref = None  # Set by Engine.__init__
@@ -698,17 +702,6 @@ class ClockWatermarkFlusher:
                 qsize, _TICKFILE_QUEUE_WARNING_THRESHOLD,
                 threading.current_thread().name,
             )
-
-    def _recover_tickfile_seqno(self) -> int:
-        """Recover tickfile seqno from existing files. Called by Engine.start()."""
-        from minute_bar.writer import recover_tickfile_seqno
-        target_date = jst_now_yyyymmdd()
-        sample_minute_key = f"{target_date}0800"
-        try:
-            return recover_tickfile_seqno(self._output_dir, sample_minute_key)
-        except Exception:
-            logger.warning("Failed to recover tickfile seqno for date=%s", target_date)
-            return 0
 
     def _write_checkpoint(self) -> None:
         files_snapshot: Dict[str, FileState]

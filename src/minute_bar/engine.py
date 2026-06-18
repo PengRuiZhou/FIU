@@ -192,6 +192,7 @@ class Engine:
             enable_time_fallback=config.recovery.enable_time_fallback,
             stall_flush_sec=config.recovery.stall_flush_sec,
             enable_tickfile=config.output.enable_tickfile,
+            enable_tickfile_commit_marker=config.recovery.enable_tickfile_commit_marker,
         )
         self._flusher._engine_ref = self  # For cross-day pause/resume + counter routing
         self._running = False
@@ -374,7 +375,7 @@ class Engine:
             self._tickfile_writer_running = True
 
             self._cleanup_tickfile_tmp_files()
-            self._state._tickfile_seqno = self._flusher._recover_tickfile_seqno()
+            # tickfile recovery + seqno handled in flusher.__init__ (INV-CM-ORDER-1)
             logger.info("Tickfile seqno recovered: %d for date %s",
                         self._state._tickfile_seqno, self._get_target_date())
 
