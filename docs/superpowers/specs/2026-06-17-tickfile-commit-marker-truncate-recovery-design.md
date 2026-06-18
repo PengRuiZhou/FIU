@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: ✅ 16 轮 review 完成（8 组 × 2 轮），sidecar + fcntl.flock + 跨输出对账 + 篡改防护 + cascade 防护 方案可进入 planning。
+> **Status**: 17 轮 review（+文件耦合/测试策略/部署 runbook），待 Round 18 复审。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
@@ -315,6 +315,65 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 | **两分钟之间**（上分钟已 commit，下分钟未开始） | 上分钟完整+marker，文件正常结尾 | 无需 truncate ✓ |
 
 关键不变量（重申 INV-CM-MONO / INV-CM-LAST）：**文件有效内容 = 截到最后一个合法 marker**；truncate 后末行必为合法 marker。marker 之后的一切都是未提交的，可安全丢弃重生。
+
+### 3.10 Round 17 文件耦合 / 测试策略 / 部署 runbook（实施级增补）
+
+> 前 16 轮覆盖设计正确性；Round 17 从**文件改动耦合、测试可执行性、部署 runbook 实操性**三个角度审查，找到从"设计对"到"实施/部署不走偏"的 gap。
+
+**C-R17-1 — pandas 依赖（项目零三方依赖 → C-R7-3 核心实证形同虚设）**
+- `requirements.txt` 明确"No third-party packages"。spec 的 `test_tickfile_csv_pandas_empirical` 的 skip-guard = 永久 skip。
+- **方案**：新建 `requirements-dev.txt` 加 `pandas`（仅开发依赖，不影响运行时零依赖）；无 pandas 时退化 csv 版兜底（`csv.reader` 断言 65 字段 + 无 `#` + 无空行），**不永久 skip**。双保险：CI 装 pandas 跑强断言；本地零依赖跑弱断言。
+
+**C-R17-2 — 无可执行部署 step list（§3.7 只给原则，未对齐 start.sh/systemd 双路径）**
+- **§3.10.1 部署 runbook**（7 步）：
+  1. 预检：`df -h output` 余量 > 3GB（sidecar + truncated 备份 + audit log）；`stat -f -c %T output` = ext4/xfs（非 nfs）；`ps aux | grep main.py` 确认单进程。
+  2. 停止：`deploy/stop.sh`（手动 nohup 路径，kill -TERM + PID 文件）或 `systemctl stop fiu-minute-bar`（systemd 路径）。
+  3. 备份：`tar czf ~/fiu_backup_pre_cm_$(date +%Y%m%d).tar.gz output/tickfile src`。
+  4. 升级代码：`rsync -av --exclude='test/' --exclude='docs/' ./ prod:~/fiu/` 或 `git pull`。
+  5. config：`production.ini` 加 `[recovery] enable_tickfile_commit_marker = true`；验证 `PYTHONPATH=src python -c "from minute_bar.config import load_config; print(load_config('config/production.ini').recovery.enable_tickfile_commit_marker)"`。
+  6. 启动：`deploy/start.sh`；首跑观察 5 分钟 `tail -F logs/*errors.log`。
+  7. 验证 sidecar：首个分钟边界后 `ls output/tickfile/*/*/tickfile_*.csv.commit` 存在 + `wc -l` ≈ 已过分钟数 - 午休。
+
+**C-R17-3 — `.truncated.*` 备份回滚安全**
+- **INV-CM-ROLLBACK-TRUNCATED-ISOLATED**：`.truncated.*` 备份文件名含 `.truncated.` 中缀 + time_ns + pid，任何 tickfile 目录扫描须 `glob('tickfile_*.csv')` 精确前缀（当前 `_cleanup_tickfile_tmp_files` glob `*.tmp` → 不匹配 → **已验证安全**）。旧代码回滚：`.truncated.*`/`.commit`/`.lock` 均不匹配 `tickfile_*.csv` → 安全忽略。
+
+**C-R17-4 — 监控告警（三种生产拓扑方案）**
+- **§3.10.2 监控 runbook**：
+  - **最小（无 Prometheus）**：cron 每分钟 `grep -E '"result":"(error|fallback)"|"truncate_bytes":[1-9]|"had_sidecar":false' output/tickfile/tickfile_recovery.log | tail -1 | mail -s "FIU alert" ops@`。
+  - **journald + Loki**：promtail scrape `tickfile_recovery.log` + Loki alert `count_over_time({filename="tickfile_recovery.log"} | json | result="error" [5m]) > 0`。
+  - **Prometheus textfile**：recovery 后写 `output/tickfile/tickfile_recovery.prom`（node_exporter `--collector.textfile.directory`），AlertManager rule `tickfile_writer_perm_dead == 1`。
+  - **audit log 路径明确**：`output_dir/tickfile/tickfile_recovery.log`（**顶层 tickfile 目录**，非嵌套 `{YYYY}/{MMDD}/`——跨日单文件累积；首次写时 `os.makedirs(output_dir/tickfile, exist_ok=True)`）。
+
+**C-R17-5 — 故障演练 runbook（4 场景）**
+- **§3.10.4 故障演练**（部署后非交易时段执行）：
+  1. **sidecar tamper**：`echo "" > ...csv.commit` → 重启 → 验证 CRITICAL `sidecar_tamper_detected`。
+  2. **hard crash recovery**：运行中 `kill -9` → 重启 → 验证 `.truncated.*` 备份 + sidecar 最后 commit 正确 + tickfile truncated。
+  3. **disk-full cascade**：`fallocate` 填满磁盘留 1MB → 观察 sidecar append IOError → 验证无重复行 + 无逐分钟回退。
+  4. **lockfile inode 竞争**：`cp + rm + cp` 替换 lockfile → 重启 → 验证 flock 互斥失效 → CRITICAL。
+
+**M-R17-A1 — flock 位置**
+- **INV-CM-FLOCK-LOCATION**：flock 仅在 `write_tickfile_rows`（L338 `_get_write_lock` 内、三分支拆分前）+ `_recover_tickfile_to_last_commit` 中获取。**禁止**在 `_get_write_lock` / `atomic_write` / `append_order_records` / `append_snapshot_records` 中加 flock（否则 snapshot/kline 写入也尝试 flock 不存在的 lockfile）。
+
+**M-R17-A2 — `_extract_minutes_from_tickfile` 循环导入**
+- **必须**提升为 `writer.py` 模块级函数（不能 defer M-OP-5）。`replay.py:62` 改为 `from minute_bar.writer import extract_minutes_from_tickfile` 薄委托。理由：`_recover_tickfile_to_last_commit`（writer.py）和 `SKIPSET-LIVE-FALLBACK`（flusher → writer）都需调用 → writer 导入 replay 会循环导入（replay 已导入 writer）。
+
+**M-R17-A3 — 跨天 recovery 时序**
+- **INV-CM-CROSSDAY-BARRIER-BEFORE-PRUNE**：跨天 recovery 须在 force-gen（L224-252）之后、状态 clear（L264）+ `_prune_write_locks`（L304）之前，且**完全返回后才执行 prune**（recovery 的 flock fd 在 with 内释放 → prune 删 `_write_locks` 条目安全）。
+
+**M-R17-A4 — 三 lazy seqno 入口 MUST 删除**
+- 强化 M-OP-1：**MUST**（非"推荐"）删除 `flusher.py:39` `recover_tickfile_seqno_lazy` + `flusher.py:702` `_recover_tickfile_seqno` + `replay.py:311` lazy seqno。`__init__` recovery 成为唯一 seqno 源。测试 `test_no_lazy_seqno_paths_remain`（grep 断言源码无 `recover_tickfile_seqno(` 调用者）。
+
+**M-R17-A6 — sidecar fsync 受 skip_fsync 控制**
+- **INV-CM-SIDECAR-SKIP-FSYNC**：sidecar append 的 fsync 同样受 `skip_fsync` 参数控制（与 tickfile rows fsync 一致）。live 路径 `skip_fsync=True` 时 sidecar 也不 fsync（否则每分钟多一次 fsync → 侵蚀 6.9x 余量 + `TestNoFsyncLiveEngine` break）。
+
+**M-R17-A8 — 首次升级推荐路径**
+- **RECOMMENDED**：接受旧分钟无 sidecar（recovery 降级 `_scan` + `INV-CM-FALLBACK-STRIP` 自愈）。replay-to-fresh 仅当旧 tickfile 已知损坏时可选，**非升级前置**。
+
+**M-R17-A5 — 测试 markers + layer**
+- plan Task 0 注册 pyproject markers（unit / integration / e2e / slow / requires_pandas / requires_fcntl）+ §7 加测试→layer 映射表。
+
+**M-R17-A7 — config 改动清单**
+- `config.py RecoveryConfig` 加 `enable_tickfile_commit_marker: bool = True`（L73 附近）+ `load_config` 加 `s.getboolean("enable_tickfile_commit_marker", ...)`（L160 附近）+ `production.ini` 等 7 个 ini 文件加 `[recovery] enable_tickfile_commit_marker = true`。
 
 ## 5. tail-check / newline-fix（sidecar 修订后：C1 自动消除）
 

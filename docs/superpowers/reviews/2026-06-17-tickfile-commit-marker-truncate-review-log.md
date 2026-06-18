@@ -1000,3 +1000,39 @@ Minor：lockfile 清理排除 today、INV-CM-REGEN-NO-SIDECAR-REWRITE 分支 2b 
 
 ### Review log
 * `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
+
+---
+
+## Review Round 17（全新角度：文件耦合 / 测试策略 / 部署 runbook）
+
+### 审核时间
+* 2026-06-18 06:00:00
+
+### 综合问题清单
+
+#### Critical
+| ID | 来源 | 问题 | 决议 |
+| -- | ---- | ---- | ---- |
+| C-R17-1 | A2 | `test_tickfile_csv_pandas_empirical` 依赖 pandas 但项目零三方依赖 → skip-guard = 永久 skip = C-R7-3 核心实证形同虚设 | Accepted — §3.10 requirements-dev.txt + csv 兜底双保险 |
+| C-R17-2 | A3 | spec 无可执行部署 step list（未对齐 start.sh/systemd 双路径 + rsync→restart 顺序） | Accepted — §3.10 §3.10.1 部署 runbook |
+| C-R17-3 | A3 | `.truncated.*` 备份回滚安全性已验证但未声明（未来 listdir 污染风险） | Accepted — §3.10 INV-CM-ROLLBACK-TRUNCATED-ISOLATED |
+| C-R17-4 | A3 | 监控告警 `tail -F|jq` 在 journald/nohup/prometheus 三种生产拓扑下不可直接执行 | Accepted — §3.10 §3.10.2 监控 runbook（cron/textfile/journald） |
+| C-R17-5 | A3 | 无生产故障演练 runbook（4 个场景缺失） | Accepted — §3.10 §3.10.4 故障演练 runbook |
+
+#### Major
+| ID | 来源 | 问题 | 决议 |
+| -- | ---- | ---- | ---- |
+| M-R17-A1 | A1 | flock 须在 _get_write_lock L338 分支拆分前（全三分支共享），spec 未明确 + 禁止在 _get_write_lock/atomic_write/append_* 中加 flock | Accepted — §3.10 INV-CM-FLOCK-LOCATION |
+| M-R17-A2 | A1 | _extract_minutes_from_tickfile 是 ReplayEngine static → writer/flusher 调用致循环导入 | Accepted — §3.10 提升为 writer.py 模块函数（不能 defer M-OP-5） |
+| M-R17-A3 | A1 | 跨天 recovery 须在 force-gen 之后、clear/prune 之前 + 完全返回后才 prune | Accepted — §3.10 INV-CM-CROSSDAY-BARRIER-BEFORE-PRUNE |
+| M-R17-A4 | A1 | 三个 lazy seqno 入口须 MUST 删除（非"推荐"） | Accepted — §3.10 强化 MUST + test_no_lazy_seqno |
+| M-R17-A5 | A2 | §7 ~65 条测试无 layer 标注 + pyproject 无 markers 注册 | Accepted — §3.10 markers 注册 + layer 映射表 |
+| M-R17-A6 | A2 | recover_tickfile_seqno 5 条现有测试去留未定 + .tmp 夹具 break + sidecar fsync skip_fsync 未声明 | Accepted — §3.10 明确去留 + 夹具修复 + INV-CM-SIDECAR-SKIP-FSYNC |
+| M-R17-A7 | A3 | production.ini 无 enable_tickfile_commit_marker key | Accepted — §3.10 config 改动清单 |
+| M-R17-A8 | A3 | 首次升级"旧分钟无 sidecar"处理未标 RECOMMENDED | Accepted — §3.10 §6 推荐"接受降级自愈" |
+| M-R17-A9 | A3 | audit log 路径未明确（顶层 vs 嵌套子目录） | Accepted — §3.10 明确 output_dir/tickfile/ 顶层 |
+
+Minor：flock subprocess fcntl importorskip、disk-full cascade side_effect 计数器模式、kill -9 不测文档化、_scan 提升影响 2 条现有测试、config.py s.getboolean 插入点、lockfile .lock 回滚文档化、回滚删 sidecar 触发 tamper 误报、三路对账夹具 helper。
+
+### Round 17 结论
+**3. 需要修改后进行 Round 18 复审。**（5 Critical + 9 Major。Agent 2 发现 pandas 依赖根本性缺失（项目零三方依赖 → C-R7-3 核心实证形同虚设）。Agent 3 从部署/监控/演练实操角度发现 spec 从"原则"到"运维照着敲命令"之间缺完整一层 runbook。Agent 1 从文件耦合角度发现循环导入 + flock 位置 + 三 lazy seqno MUST 删除。）
