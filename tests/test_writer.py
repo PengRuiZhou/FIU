@@ -594,17 +594,20 @@ class TestRecoverTickfileSeqno:
         assert result == 10
 
     def test_skips_truncated_lines(self, tmp_path):
+        # NOTE: recover_tickfile_seqno now returns the MAX valid seqno (was: last seen).
+        # T4 commit-marker refactor: thin wrapper delegates to _scan_tickfile_rows which uses max()
+        # so callers seeding the next seqno (flusher, replay) get max+1 (INV-CM-SEQNO-MONO-FILE).
         path = get_tickfile_path(str(tmp_path), "202606020900")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(TICKFILE_HEADER + "\n")
-            fields = ["col"] * 59 + ["7203"] + ["col"] * 5
+            fields = ["col"] * 59 + ["42"] + ["col"] * 5
             f.write(",".join(fields) + "\n")
             f.write("truncated\n")
-            fields2 = ["col"] * 59 + ["42"] + ["col"] * 5
+            fields2 = ["col"] * 59 + ["7203"] + ["col"] * 5
             f.write(",".join(fields2) + "\n")
         result = recover_tickfile_seqno(str(tmp_path), "202606020900")
-        assert result == 42
+        assert result == 7203
 
 
 class TestTickfileMaxRowBytesAssert:

@@ -201,3 +201,129 @@ def test_write_legacy_mode_no_sidecar(tmp_path):
     tf = get_tickfile_path(str(tmp_path), "202605280931")
     assert not os.path.exists(tf + ".commit")  # no sidecar
     assert os.path.exists(tf)
+
+
+def test_recover_truncates_partial_to_last_commit(tmp_path):
+    from minute_bar.writer import _recover_tickfile_to_last_commit, get_tickfile_path
+    import os
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed = TICKFILE_HEADER + "\n" + ("a" * 60) + "\n"
+    partial = "PARTIAL_ROW_BYTES"
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + partial.encode())
+    committed_off = len(committed.encode())
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,{committed_off},1,1\n")
+    cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), date, enable_commit_marker=True)
+    assert had is True
+    assert f"{date}0931" in cset
+    assert seq == 1
+    assert os.path.getsize(tf) == committed_off     # truncated
+    assert b"PARTIAL_ROW_BYTES" not in open(tf, "rb").read()
+
+
+def test_recover_backup_created(tmp_path):
+    from minute_bar.writer import _recover_tickfile_to_last_commit, get_tickfile_path
+    import glob, os
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed = TICKFILE_HEADER + "\n" + ("a" * 60) + "\n"
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + b"DROPPED_TAIL")
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,{len(committed.encode())},1,1\n")
+    _recover_tickfile_to_last_commit(str(tmp_path), date, enable_commit_marker=True)
+    backups = glob.glob(tf + ".truncated.*")
+    assert len(backups) == 1
+    assert open(backups[0], "rb").read() == b"DROPPED_TAIL"
+
+
+def test_recover_offset_exceeds_size_aborts(tmp_path):
+    from minute_bar.writer import _recover_tickfile_to_last_commit, get_tickfile_path
+    import os
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    open(tf, "wb").write(b"H\n" + b"x" * 90)   # size 92
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,500,1,1\n")        # offset 500 > 92
+    cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), date, enable_commit_marker=True)
+    assert had is False                          # fallback, no truncate
+    assert os.path.getsize(tf) == 92             # unchanged (no sparse gap)
+
+
+def test_recover_sidecar_missing_fallback_row_scan_no_truncate(tmp_path):
+    from minute_bar.writer import _recover_tickfile_to_last_commit, get_tickfile_path
+    import os
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    fields = [""] * 65
+    fields[16] = f"{date} 09:31:00"
+    fields[59] = "5"
+    with open(tf, "w") as f:
+        f.write(TICKFILE_HEADER + "\n" + ",".join(fields) + "\n")
+    size_before = os.path.getsize(tf)
+    cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), date, enable_commit_marker=True)
+    assert had is False
+    assert f"{date}0931" in cset
+    assert seq == 5
+    assert os.path.getsize(tf) == size_before    # no truncate in fallback
+
+
+def test_recover_tickfile_missing_returns_empty(tmp_path):
+    from minute_bar.writer import _recover_tickfile_to_last_commit
+    cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), "20260528", enable_commit_marker=True)
+    assert had is False and cset == set() and seq == 0
+
+
+def test_recover_writes_audit_log(tmp_path):
+    from minute_bar.writer import _recover_tickfile_to_last_commit
+    import os, json
+    _recover_tickfile_to_last_commit(str(tmp_path), "20260528", enable_commit_marker=True)
+    log = os.path.join(str(tmp_path), "tickfile", "tickfile_recovery.log")
+    assert os.path.exists(log)
+    rec = json.loads(open(log).readline())
+    for k in ("ts", "date", "pid", "hostname", "had_sidecar", "committed_count",
+              "last_commit_minute", "truncate_bytes", "result"):
+        assert k in rec
+
+
+def test_recover_audit_failure_does_not_abort(tmp_path, monkeypatch):
+    import os as _os
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(_os, "makedirs", boom)
+    from minute_bar.writer import _recover_tickfile_to_last_commit
+    cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), "20260528", enable_commit_marker=True)
+    assert had is False  # audit failure must NOT abort recovery
+
+
+def test_recover_truncate_oserror_aborts_without_corrupting(tmp_path, monkeypatch):
+    """INV-CM-FAIL-ATOMIC: if os.truncate raises during sidecar-mode recovery, the function re-raises
+    and the tickfile content is left intact (no partial corruption). Backup may or may not exist."""
+    import os
+    from minute_bar import writer as W
+    date = "20260528"
+    tf = W.get_tickfile_path(str(tmp_path), f"{date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed = TICKFILE_HEADER + "\n" + ("a" * 60) + "\n"
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + b"DROPPED_TAIL")
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,{len(committed.encode())},1,1\n")
+
+    def boom_truncate(*a, **k):
+        raise OSError("truncate boom")
+    monkeypatch.setattr(W.os, "truncate", boom_truncate)
+
+    import pytest
+    with pytest.raises(OSError):
+        W._recover_tickfile_to_last_commit(str(tmp_path), date, enable_commit_marker=True)
+    # committed content still intact (the "a"*60 row survives; DROPPED_TAIL may or may not, but no corruption of committed bytes)
+    data = open(tf, "rb").read()
+    assert data.startswith(TICKFILE_HEADER.encode())
+    assert (b"a" * 60) in data

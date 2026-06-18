@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
+import socket
 import threading
 from typing import Dict, List, Optional, Tuple
 
@@ -481,58 +483,203 @@ def _parse_commit_line(line: str) -> Optional[Tuple[str, int, int, int]]:
 
 
 def recover_tickfile_seqno(output_dir: str, minute_key: str) -> int:
+    """Thin wrapper (deprecated by sidecar recovery; kept for back-compat). Returns last seqno."""
     path = get_tickfile_path(output_dir, minute_key)
-
     if not os.path.exists(path):
         return 0
-
     try:
-        file_size = os.path.getsize(path)
+        return _scan_tickfile_rows(path)[1]
     except OSError:
         return 0
 
-    if file_size == 0:
-        return 0
 
-    MAX_RECOVERY_SIZE = 200 * 1024 * 1024  # 200MB
-    if file_size > MAX_RECOVERY_SIZE:
-        logger.warning(
-            "Tickfile seqno recovery skipped: %s file too large (%dMB > %dMB)",
-            path, file_size // (1024 * 1024), MAX_RECOVERY_SIZE // (1024 * 1024),
-        )
-        return 0
+def _scan_tickfile_rows(path: str):
+    """Single-pass row scan (M-R23-2): returns (minute_set, last_seqno) from a tickfile.
+    Reads UpdateTime (col 16) + Seqno (col 59); skips header + non-65-field lines."""
+    minutes: set = set()
+    last_seqno = 0
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        for line_num, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped or line_num == 1:
+                continue
+            fields = stripped.split(",")
+            if len(fields) != 65:
+                continue
+            mk = fields[16].replace(" ", "").replace(":", "")[:12]
+            if len(mk) == 12 and mk.isdigit():
+                minutes.add(mk)
+            try:
+                last_seqno = max(last_seqno, int(fields[59]))
+            except (ValueError, IndexError):
+                pass
+    return minutes, last_seqno
 
-    last_valid_seqno = 0
-    line_num = 0
+
+class _FallbackSignal(Exception):
+    pass
+
+
+def _backup_truncated_tail(tickfile_path: str, offset: int, old_size: int) -> bool:
+    """Copy [offset, old_size) to a .truncated.{time_ns}.{pid} file. Returns False on IO failure."""
+    import time as _time
     try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            for line in f:
-                line_num += 1
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                fields = stripped.split(',')
-                if len(fields) != 65:
-                    logger.warning(
-                        "Tickfile seqno recovery: skipped corrupted line at line %d",
-                        line_num,
-                    )
-                    continue
-                try:
-                    seqno_val = int(fields[59])
-                    last_valid_seqno = seqno_val
-                except (ValueError, IndexError):
-                    logger.warning(
-                        "Tickfile seqno recovery: skipped non-integer seqno at line %d",
-                        line_num,
-                    )
-                    continue
-    except (FileNotFoundError, OSError):
-        return 0
+        with open(tickfile_path, "rb") as f:
+            f.seek(offset)
+            tail = f.read(old_size - offset)
+        backup_path = f"{tickfile_path}.truncated.{_time.time_ns()}.{os.getpid()}"
+        with open(backup_path, "wb") as bf:
+            bf.write(tail)
+            bf.flush()
+            os.fsync(bf.fileno())
+        return True
+    except OSError:
+        logger.exception("Backup of truncated tail failed for %s", tickfile_path)
+        return False
 
-    if last_valid_seqno > 0:
-        logger.info("Tickfile seqno recovered: %s seqno=%d", path, last_valid_seqno)
-    return last_valid_seqno
+
+def _tail_strip_partial_last_line(tickfile_path: str) -> int:
+    """INV-CM-FALLBACK-STRIP: if the last line isn't a complete 65-field data row,
+    truncate the file back to the last '\\n' boundary. Returns bytes stripped."""
+    try:
+        size = os.path.getsize(tickfile_path)
+    except OSError:
+        return 0
+    if size == 0:
+        return 0
+    tail = min(size, TICKFILE_TAIL_READ_SIZE)
+    with open(tickfile_path, "rb") as f:
+        f.seek(-tail, 2)
+        data = f.read()
+    # find the last newline; if file ends with a complete 65-field line, strip nothing
+    last_nl = data.rfind(b"\n")
+    if last_nl == len(data) - 1:
+        seg = data[:last_nl]
+        inner_nl = seg.rfind(b"\n")
+        last_line = seg[inner_nl + 1:].decode("utf-8", errors="replace").strip()
+        if last_line and len(last_line.split(",")) == 65:
+            return 0
+    if last_nl == -1:
+        keep = 0
+    else:
+        keep = size - len(data) + last_nl + 1  # bytes before the partial tail (incl. the newline)
+    if keep < size:
+        os.truncate(tickfile_path, keep)
+        logger.critical("Tickfile tail-strip: removed %d partial bytes from %s", size - keep, tickfile_path)
+        return size - keep
+    return 0
+
+
+def _write_recovery_audit(output_dir, date, *, had_sidecar, committed_count,
+                          last_commit_minute, truncate_bytes, result, fallback_mode=False):
+    """Best-effort persistent audit log (INV-CM-AUDIT-BESTEFFORT). Never raises."""
+    try:
+        import time as _time
+        log_dir = os.path.join(output_dir, "tickfile")
+        os.makedirs(log_dir, exist_ok=True)  # C-R25-2: self-create, don't rely on data path
+        rec = {
+            "ts": _time.time(),
+            "date": date,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname() or "unknown",
+            "had_sidecar": had_sidecar,
+            "committed_count": committed_count,
+            "last_commit_minute": last_commit_minute,
+            "truncate_bytes": truncate_bytes,
+            "result": result,           # truncate | noop | fallback | error | tamper
+            "fallback_mode": fallback_mode,
+        }
+        with open(os.path.join(log_dir, "tickfile_recovery.log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        logger.debug("audit log write failed (best-effort)", exc_info=True)
+
+
+def _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker, has_sidecar_file, result):
+    """Single-pass row scan + optional tail-strip. INV-CM-FAIL-ATOMIC: scan in try; mutate only after.
+
+    INV-CM-FALLBACK-STRIP (M-R7-2): tail-strip runs ONLY on the sidecar-MISSING path
+    (has_sidecar_file=False). When the sidecar exists but is untrustworthy (e.g.
+    INV-CM-SIDECAR-OFFSET-BOUND violation), we do NOT mutate the file — that signals
+    tamper/inconsistency, and the conservative action is read-only scan."""
+    try:
+        committed_set, last_seqno = _scan_tickfile_rows(tickfile_path)
+    except OSError:
+        logger.exception("fallback row scan failed %s; file untouched", tickfile_path)
+        _write_recovery_audit(output_dir, date, had_sidecar=False, committed_count=0,
+                              last_commit_minute=None, truncate_bytes=0, result="error", fallback_mode=True)
+        raise
+    truncate_bytes = 0
+    if enable_commit_marker and not has_sidecar_file:
+        truncate_bytes = _tail_strip_partial_last_line(tickfile_path)
+    _write_recovery_audit(output_dir, date, had_sidecar=False,
+                          committed_count=len(committed_set),
+                          last_commit_minute=(max(committed_set) if committed_set else None),
+                          truncate_bytes=truncate_bytes, result=result, fallback_mode=True)
+    return (committed_set, last_seqno, False)
+
+
+def _recover_tickfile_to_last_commit(output_dir: str, date: str, enable_commit_marker: bool = True):
+    """Read sidecar, truncate tickfile to last commit. Returns (committed_set, last_seqno, had_sidecar).
+    had_sidecar=True  -> sidecar authoritative; tickfile truncated to max offset.
+    had_sidecar=False -> fallback single-pass row scan (minutes + seqno); tail-strip only when commit_marker on.
+    INV-CM-RECOVERY-GATE: when enable_commit_marker=False, still returns row-scan fallback (had_sidecar=False)."""
+    sample_mk = f"{date}0000"
+    tickfile_path = get_tickfile_path(output_dir, sample_mk)
+    sidecar_path = tickfile_path + ".commit"
+    lockfile_path = tickfile_path + ".lock"
+
+    if not os.path.exists(tickfile_path):
+        _write_recovery_audit(output_dir, date, had_sidecar=False, committed_count=0,
+                              last_commit_minute=None, truncate_bytes=0, result="noop")
+        return (set(), 0, False)
+
+    sidecar_records = _read_valid_sidecar(sidecar_path, date)
+    has_sidecar_file = sidecar_records is not None
+
+    # --- sidecar mode (enabled + non-empty valid records) ---
+    if enable_commit_marker and sidecar_records:
+        with _get_write_lock(tickfile_path):
+            with _flock_critical_section(lockfile_path):
+                try:
+                    records = _read_valid_sidecar(sidecar_path, date) or []
+                    if not records:
+                        raise _FallbackSignal()
+                    current_size = os.path.getsize(tickfile_path)
+                    max_rec = max(records, key=lambda r: r[1])      # INV-CM-OFFSET-MAX
+                    max_offset = max_rec[1]
+                    last_seqno = max_rec[3]
+                    committed_set = {r[0] for r in records}
+                    if max_offset > current_size:                   # INV-CM-SIDECAR-OFFSET-BOUND
+                        logger.critical("sidecar offset %d > tickfile size %d (%s); fallback",
+                                        max_offset, current_size, tickfile_path)
+                        raise _FallbackSignal()
+                    truncate_bytes = 0
+                    result = "noop"
+                    if current_size > max_offset:
+                        if not _backup_truncated_tail(tickfile_path, max_offset, current_size):
+                            logger.critical("backup failed; aborting truncate (degraded) %s", tickfile_path)
+                            raise _FallbackSignal()
+                        os.truncate(tickfile_path, max_offset)      # path-based, atomic; FAIL-ATOMIC-safe
+                        truncate_bytes = current_size - max_offset
+                        result = "truncate"
+                except _FallbackSignal:
+                    return _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker,
+                                             has_sidecar_file, "fallback")
+                except OSError:
+                    logger.exception("recovery truncate failed (INV-CM-FAIL-ATOMIC) %s", tickfile_path)
+                    _write_recovery_audit(output_dir, date, had_sidecar=False, committed_count=0,
+                                          last_commit_minute=None, truncate_bytes=0, result="error",
+                                          fallback_mode=True)
+                    raise
+                _write_recovery_audit(output_dir, date, had_sidecar=True,
+                                      committed_count=len(committed_set),
+                                      last_commit_minute=max_rec[0],
+                                      truncate_bytes=truncate_bytes, result=result)
+                return (committed_set, last_seqno, True)
+
+    # --- fallback path ---
+    return _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker, has_sidecar_file, "fallback")
 
 
 def extract_minutes_from_tickfile(path: str) -> set:
