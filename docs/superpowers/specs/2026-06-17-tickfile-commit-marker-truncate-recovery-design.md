@@ -1,7 +1,7 @@
 # Tickfile Commit-Marker + Truncate 恢复设计（mid-append 崩溃恢复）
 
 > **Date**: 2026-06-17
-> **Status**: 23 轮 review（+REGEN truncate flock/cross-day forcegen/skip_fsync MONO），待 Round 24 复审。
+> **Status**: ✅ 24 轮 review 完成（12 组 × 2 轮），可进入 planning。
 > **Parent**: 源于 tickfile-stale-fix（`2026-06-16-tickfile-stale-fix-design.md`）E2E 验证后的深度审查
 > **类型**: 行为变更（tickfile 写盘加 commit marker）+ 恢复增强（truncate-to-last-commit）
 > **Review**: `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
