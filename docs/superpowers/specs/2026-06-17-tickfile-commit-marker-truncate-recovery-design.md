@@ -320,11 +320,10 @@ recovery 只认**单调性**：marker 落盘 ⟺ 该分钟完整。kernel 按 pa
 
 > 前 18 轮覆盖设计正确性到部署 runbook；Round 19 从**Phase 22 round-up 语义变更的跨版本混存 + Phase 18 BG writer 的 pause/resume/health-check 实际代码与 spec INV 的对齐 + fd 生命周期泄漏**三个角度审查。
 
-**C-R19-1 — Phase 22 round-up 边界混存：旧 round-down tickfile + 新 round-up tickfile 同 output_dir**
-- **场景**：Phase 22（左开右闭 round-up，commit d606692→76830d2）前的 tickfile 用旧 round-down 语义（`15:30:00→1529`），Phase 22 后用新 round-up（`15:30:00→1530`）。若同一 output_dir 内混存旧 + 新语义的 tickfile 行 → `_extract_minutes_from_tickfile`（降级路径）切出的 minute_key 含旧语义键（1529），而新代码 committed_set 用新语义键（1530）→ **replay 视旧 1529 为 gap → 重生 → 与旧行并存或字面重复**。
-- **INV-CM-ROUNDUP-BOUNDARY**：sidecar recovery 首跑（`had_sidecar=False` 降级 + tickfile 非平凡）时，audit log 记录 `legacy_last_updatetime`（tickfile 末行 UpdateTime 原始值），供运维判断是否跨越 Phase 22 边界。
-- **replay-to-fresh 升级为 SHOULD**（M-R17-A8 的 RECOMMENDED 升级）：round-up 边界混存是 replay-to-fresh 的**硬触发条件**（spec §6 明写）。
-- 测试 `test_roundup_boundary_mixed_file_emits_warning`。
+**C-R19-1 — ~~Phase 22 round-up 边界混存~~（Rejected：用户确认前提不成立）**
+- ~~场景：Phase 22 round-up 语义变更前后的 tickfile 行混存同一 output_dir~~
+- **Rejected 理由**（用户确认）：tickfile 是 **per-day 文件**（`tickfile_{date}.csv`），每个交易日从头创建。代码变更部署在**交易时段外**（stop → upgrade → start），Day N 的 tickfile 全程旧代码生成（全 round-down），Day N+1 全程新代码（全 round-up）——**同一个 daily tickfile 文件内不会混存两种语义**。即使极端中途部署，引擎重启后新进程全部用新 round-up，且 tickfile 是可 replay 重生成的派生输出。
+- `INV-CM-ROUNDUP-BOUNDARY` / `replay-to-fresh SHOULD` / `test_roundup_boundary_mixed_file_emits_warning` **全部撤销**。
 
 **C-R19-2 — engine.py:1458 health-check 实际不调 recovery，spec INV-CM-ORDER-RESTART 未落地**
 - **场景**：writer 线程死亡（engine.py:1458 health-check）→ 实际代码只 `drain + new thread`（L1477-1493），**无 recovery、无 skip-set 同步**。spec §3.4 INV-CM-ORDER-RESTART 要求"health-check restart 前调 recovery"——**与代码直接矛盾**。
