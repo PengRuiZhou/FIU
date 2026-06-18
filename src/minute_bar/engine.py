@@ -376,7 +376,7 @@ class Engine:
 
             self._cleanup_tickfile_tmp_files()
             # tickfile recovery + seqno handled in flusher.__init__ (INV-CM-ORDER-1)
-            logger.info("Tickfile seqno recovered: %d for date %s",
+            logger.info("Tickfile seqno at init: %d for date %s",
                         self._state._tickfile_seqno, self._get_target_date())
 
             self._tickfile_writer_thread = threading.Thread(
@@ -1363,6 +1363,7 @@ class Engine:
                 "Tickfile drain timed out after %.0fs: %d entries abandoned",
                 timeout_sec, abandoned,
             )
+        self._flusher._run_tickfile_recovery()
         return drained
 
     def _tickfile_writer_pause(self) -> None:
@@ -1421,6 +1422,7 @@ class Engine:
         self._tickfile_writer_alive = False
         self._tickfile_writer_thread = None
         stale_drained = self._tickfile_writer_drain()
+        self._flusher._run_tickfile_recovery()
 
         pause_duration_ms = (_time.monotonic() - pause_start) * 1000
         logger.info(
@@ -1476,6 +1478,7 @@ class Engine:
             return
 
         self._tickfile_writer_error_count = 0
+        self._flusher._run_tickfile_recovery()
         self._tickfile_writer_drain(timeout_sec=3.0)
 
         if self._tickfile_writer_thread is not None and self._tickfile_writer_thread.is_alive():

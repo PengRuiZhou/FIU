@@ -207,3 +207,36 @@ def test_flusher_init_runs_recovery_and_populates_skipset(tmp_path):
     assert os.path.getsize(tf) == len(committed.encode())  # truncated
     assert f"{date}0931" in state._generated_tickfile_minutes
     assert state._tickfile_seqno == 9
+
+
+def test_run_tickfile_recovery_truncates_and_syncs_state(tmp_path):
+    """INV-CM-ORDER-RESTART: _run_tickfile_recovery truncates partial + syncs skip-set/seqno at runtime."""
+    import os
+    from unittest.mock import patch
+    from minute_bar.aggregator import SharedState
+    from minute_bar.tickfile import TICKFILE_HEADER
+    from minute_bar.writer import get_tickfile_path
+    from tests.test_tickfile_sync import _make_flusher
+
+    state = SharedState()
+    state.first_data_received = True
+    date = "20260602"  # _make_flusher patches jst_now to this
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed = TICKFILE_HEADER + "\n" + ("a" * 60) + "\n"
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + b"PARTIAL_TAIL")
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{date}0931,{len(committed.encode())},1,7\n")
+
+    flusher = _make_flusher(state, tmp_path, enable_tickfile=True)
+    # __init__ already recovered once; now corrupt again to prove runtime recovery works
+    with open(tf, "wb") as f:
+        f.write(committed.encode() + b"PARTIAL_TAIL_AGAIN")
+    state._generated_tickfile_minutes.clear()
+    state._tickfile_seqno = 0
+    with patch("minute_bar.flusher.jst_now_yyyymmdd", return_value=date):
+        flusher._run_tickfile_recovery()
+    assert os.path.getsize(tf) == len(committed.encode())  # truncated again
+    assert f"{date}0931" in state._generated_tickfile_minutes
+    assert state._tickfile_seqno == 7

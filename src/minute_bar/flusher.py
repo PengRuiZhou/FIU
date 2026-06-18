@@ -242,7 +242,13 @@ class ClockWatermarkFlusher:
                     try:
                         self._try_generate_tickfile(mk)
                     except Exception:
-                        logger.exception("Cross-day tickfile generation failed for minute=%s", mk)
+                        logger.warning("Cross-day tickfile force-gen retry once for minute=%s", mk, exc_info=True)
+                        try:
+                            self._try_generate_tickfile(mk)
+                        except Exception:
+                            logger.critical(
+                                "Cross-day tickfile force-gen FAILED twice minute=%s (data lost on clear)", mk,
+                                exc_info=True)
             if skipped_keys:
                 # Remove skipped from pending so the Fix-G check below does not log them
                 # as failures; they are intentionally deferred to replay as 'missing'.
@@ -585,6 +591,25 @@ class ClockWatermarkFlusher:
             )
         if self._enable_order and order_records:
             write_order_file(self._output_dir, minute_key, order_records)
+
+    def _run_tickfile_recovery(self) -> None:
+        """Run sidecar recovery + sync skip-set/seqno. Called by engine health-check/drain/pause
+        (INV-CM-ORDER-RESTART) and is idempotent. No-op when tickfile disabled."""
+        if not self._enable_tickfile:
+            return
+        from minute_bar.writer import _recover_tickfile_to_last_commit
+        target_date = jst_now_yyyymmdd()
+        try:
+            committed_set, last_seqno, had_sidecar = _recover_tickfile_to_last_commit(
+                self._output_dir, target_date,
+                enable_commit_marker=self._enable_tickfile_commit_marker)
+        except Exception:
+            logger.exception("Tickfile recovery (runtime) failed for date=%s", target_date)
+            return
+        if had_sidecar or committed_set:
+            with self._state.lock:
+                self._state._generated_tickfile_minutes |= committed_set
+                self._state._tickfile_seqno = max(self._state._tickfile_seqno, last_seqno)
 
     def _try_generate_tickfile(self, minute_key: str) -> None:
         """Generate tickfile for a minute. Thread-safe. Callable from any thread.
