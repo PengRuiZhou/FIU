@@ -66,6 +66,11 @@ class ReplayEngine:
     def run(self) -> None:
         logger.info("Replay mode: loading data for date %s", self._date)
 
+        # INV-CM-FS-CHECK-RUNTIME (T11): reject network filesystems at startup, before any
+        # tickfile recovery runs. No-op on Windows dev/test (_HAS_FCNTL=False).
+        from minute_bar.writer import check_output_fs_local
+        check_output_fs_local(self._config.output.output_dir)
+
         self._code_table.load(self._date)
         logger.info("Code table: %d symbols", len(self._code_table.table))
 

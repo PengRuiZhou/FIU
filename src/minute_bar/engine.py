@@ -362,6 +362,11 @@ class Engine:
                     os.remove(tmp_path)
 
     def start(self) -> None:
+        # INV-CM-FS-CHECK-RUNTIME (T11): reject network filesystems at startup, before any
+        # tickfile recovery / writer thread runs. No-op on Windows dev/test (_HAS_FCNTL=False).
+        from minute_bar.writer import check_output_fs_local
+        check_output_fs_local(self._config.output.output_dir)
+
         self._restore_from_checkpoint()
         self._running = True
 

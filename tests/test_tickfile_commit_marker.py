@@ -788,3 +788,169 @@ def test_tickfile_pure_csv_reader_no_hash_rows(tmp_path):
         sc = list(csv.reader(f))
     assert all(len(r) == 4 for r in sc)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 11 (T11) — tamper detection (INV-CM-SIDECAR-TAMPER-DETECT),
+# .truncated.* retention (INV-CM-RETENTION), fs runtime check (INV-CM-FS-CHECK-RUNTIME).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_sidecar_missing_with_nontrivial_tickfile_critical(tmp_path, caplog):
+    """INV-CM-SIDECAR-TAMPER-DETECT: big tickfile with committed rows, no sidecar -> CRITICAL tamper."""
+    import json, logging, os
+    from minute_bar.writer import (
+        _recover_tickfile_to_last_commit, get_tickfile_path, TICKFILE_TAMPER_THRESHOLD_BYTES,
+    )
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    # Build a tickfile > threshold with valid 65-field rows (so committed_set is non-empty), NO sidecar.
+    fields = [""] * 65
+    fields[16] = f"{date} 09:31:00"   # UpdateTime col -> minute 0931
+    fields[59] = "1"                   # Seqno col
+    row = ",".join(fields)
+    # Write enough copies to exceed the tamper threshold.
+    with open(tf, "wb") as f:
+        f.write(TICKFILE_HEADER.encode() + b"\n")
+        while f.tell() < TICKFILE_TAMPER_THRESHOLD_BYTES + 1024:
+            f.write(row.encode() + b"\n")
+    assert os.path.getsize(tf) > TICKFILE_TAMPER_THRESHOLD_BYTES
+
+    with caplog.at_level(logging.CRITICAL, logger="minute_bar.writer"):
+        cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), date, enable_commit_marker=True)
+
+    assert had is False
+    assert f"{date}0931" in cset            # row scan still reconstructed the minute
+    assert any("sidecar_missing_nontrivial_tickfile" in r.message for r in caplog.records)
+
+    # The audit record's `result` must be overridden to "tamper".
+    log = os.path.join(str(tmp_path), "tickfile", "tickfile_recovery.log")
+    assert os.path.exists(log)
+    last = [json.loads(l) for l in open(log, encoding="utf-8") if l.strip()][-1]
+    assert last["result"] == "tamper"
+
+
+def test_sidecar_missing_tiny_tickfile_no_tamper(tmp_path, caplog):
+    """INV-CM-SIDECAR-TAMPER-DETECT: header-only / tiny tickfile w/o sidecar is normal, NOT tamper."""
+    import json, logging, os
+    from minute_bar.writer import _recover_tickfile_to_last_commit, get_tickfile_path
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    # A single small row -> well under the threshold, no sidecar (legacy/fresh-start scenario).
+    fields = [""] * 65
+    fields[16] = f"{date} 09:31:00"
+    fields[59] = "1"
+    with open(tf, "w") as f:
+        f.write(TICKFILE_HEADER + "\n" + ",".join(fields) + "\n")
+
+    with caplog.at_level(logging.CRITICAL, logger="minute_bar.writer"):
+        cset, seq, had = _recover_tickfile_to_last_commit(str(tmp_path), date, enable_commit_marker=True)
+
+    assert had is False
+    assert f"{date}0931" in cset
+    assert not any("sidecar_missing_nontrivial_tickfile" in r.message for r in caplog.records)
+    log = os.path.join(str(tmp_path), "tickfile", "tickfile_recovery.log")
+    last = [json.loads(l) for l in open(log, encoding="utf-8") if l.strip()][-1]
+    assert last["result"] == "fallback"    # NOT tamper — tiny tickfile is benign
+
+
+def test_truncated_retention_keeps_newest(tmp_path):
+    """INV-CM-RETENTION: more than MAX_TRUNCATED_BACKUPS -> oldest pruned, newest survive."""
+    import glob, os
+    from minute_bar.writer import (
+        _prune_truncated_backups, MAX_TRUNCATED_BACKUPS, get_tickfile_path,
+    )
+    tf = get_tickfile_path(str(tmp_path), "202605280000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    n = MAX_TRUNCATED_BACKUPS + 5
+    # Filename layout: <tf>.truncated.<i>.999 ; parse the <i> segment after the '.truncated.' prefix.
+    for i in range(n):
+        p = f"{tf}.truncated.{i}.999"   # time_ns placeholder; deterministic mtime set below
+        open(p, "w").close()
+        os.utime(p, (i, i))             # distinct increasing mtimes -> deterministic ordering
+    _prune_truncated_backups(tf)
+    remaining = glob.glob(f"{tf}.truncated.*")
+    assert len(remaining) == MAX_TRUNCATED_BACKUPS
+
+    # Recover the per-file <i> index robustly (split off the .truncated. prefix, then take [0]).
+    prefix = ".truncated."
+    def _idx(p):
+        tail = os.path.basename(p).split(prefix, 1)[1]   # "<i>.999"
+        return int(tail.split(".", 1)[0])
+    surviving = sorted(_idx(p) for p in remaining)
+    # The newest (highest mtime i) must survive: indices [n-MAX, n).
+    assert surviving == list(range(n - MAX_TRUNCATED_BACKUPS, n))
+
+
+def test_truncated_retention_no_op_when_under_limit(tmp_path):
+    """INV-CM-RETENTION: <= MAX_TRUNCATED_BACKUPS -> nothing deleted (guard against the len()<=keep early return)."""
+    import glob, os
+    from minute_bar.writer import (
+        _prune_truncated_backups, MAX_TRUNCATED_BACKUPS, get_tickfile_path,
+    )
+    tf = get_tickfile_path(str(tmp_path), "202605280000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    n = MAX_TRUNCATED_BACKUPS        # exactly at the limit -> no prune
+    for i in range(n):
+        open(f"{tf}.truncated.{i}.999", "w").close()
+    _prune_truncated_backups(tf)
+    assert len(glob.glob(f"{tf}.truncated.*")) == n
+
+
+def test_engine_rejects_nfs_output_dir(tmp_path, monkeypatch):
+    """INV-CM-FS-CHECK-RUNTIME: a network fs type -> RuntimeError. The helper's POSIX branch
+    is forced via monkeypatch (_HAS_FCNTL=True + a fake /proc/mounts) so the check is exercised
+    even on Windows dev/test (where it is otherwise a no-op)."""
+    from minute_bar import writer as W
+    monkeypatch.setattr(W, "_HAS_FCNTL", True)   # force the POSIX branch regardless of platform
+
+    import builtins
+    real_open = builtins.open
+    # Fake /proc/mounts: tmpfs at /, nfs mounted exactly at tmp_path.
+    proc_content = (
+        "tmpfs / tmpfs rw 0 0\n"
+        f"nfs {tmp_path} nfs rw,vers=4 0 0\n"
+    )
+
+    def fake_open(path, *a, **k):
+        if str(path) == "/proc/mounts":
+            import io
+            return io.StringIO(proc_content)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    with pytest.raises(RuntimeError, match="nfs"):
+        W.check_output_fs_local(str(tmp_path))
+
+
+def test_fs_check_passes_local_fstype(tmp_path, monkeypatch):
+    """INV-CM-FS-CHECK-RUNTIME: local fs types (ext4/xfs/tmpfs) are accepted (no raise)."""
+    from minute_bar import writer as W
+    monkeypatch.setattr(W, "_HAS_FCNTL", True)
+    import builtins
+    real_open = builtins.open
+    proc_content = (
+        "tmpfs / tmpfs rw 0 0\n"
+        f"ext4 {tmp_path} ext4 rw 0 0\n"
+    )
+
+    def fake_open(path, *a, **k):
+        if str(path) == "/proc/mounts":
+            import io
+            return io.StringIO(proc_content)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    # Must not raise on ext4.
+    W.check_output_fs_local(str(tmp_path))
+
+
+def test_fs_check_noop_when_fcntl_unavailable(tmp_path):
+    """INV-CM-FS-CHECK-RUNTIME (M-R25-3): on non-POSIX (Windows dev/test) the check is a no-op,
+    so even an 'nfs' path is accepted (production is Linux; the check is enforced there)."""
+    from minute_bar import writer as W
+    # _HAS_FCNTL is False on Windows -> immediate return. Confirm it does not raise.
+    assert W._HAS_FCNTL is False
+    W.check_output_fs_local(str(tmp_path))   # must not raise
+

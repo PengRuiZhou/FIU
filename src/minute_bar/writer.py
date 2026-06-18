@@ -34,6 +34,17 @@ assert TICKFILE_TAIL_READ_SIZE >= TICKFILE_MAX_ROW_BYTES * 6, (
 SIDECAR_TAIL_READ_SIZE = 65536   # full-day sidecar ~16KB; cap a tail read at 64KB (INV-CM-SIDECAR-MAXSIZE)
 MAX_SIDECAR_SIZE = 1 * 1024 * 1024  # 1MB sanity cap (normal ~16KB)
 
+# INV-CM-SIDECAR-TAMPER-DETECT (T11): non-trivial tickfile w/o usable sidecar = tamper signal.
+# Header-only / tiny tickfiles without a sidecar are normal (fresh start, legacy write); only a
+# tickfile that has substantial committed data but no sidecar is flagged as a possible tamper /
+# accidental deletion. 10KB above the header comfortably exceeds any single-minute row payload.
+TICKFILE_TAMPER_THRESHOLD_BYTES = len(TICKFILE_HEADER) + 10 * 1024
+
+# INV-CM-RETENTION (T11): keep only the newest N .truncated.* backups per tickfile directory.
+# Prevents the disk-full cascade (C-R15-1) where each truncate feeds a fresh backup that in turn
+# contributes to further truncates. 10 backups >> any realistic single-day recovery churn.
+MAX_TRUNCATED_BACKUPS = 10
+
 
 def _fmt(value: float, decimal: int) -> str:
     return f"{value:.{decimal}f}"
@@ -596,6 +607,73 @@ def _write_recovery_audit(output_dir: str, date: str, *, had_sidecar: bool, comm
         logger.debug("audit log write failed (best-effort)", exc_info=True)
 
 
+def _prune_truncated_backups(tickfile_path: str, keep: int = MAX_TRUNCATED_BACKUPS) -> None:
+    """Keep only the newest `keep` .truncated.* backups in the tickfile's directory
+    (INV-CM-RETENTION). Best-effort: never raises. Prevents the disk-full cascade (C-R15-1)
+    where each truncate feeds a fresh backup that contributes to further truncates.
+
+    Scoped by exact `<tickfile_basename>.truncated.` prefix so unrelated files (other dates,
+    other instruments) are never matched. Newest = highest mtime."""
+    try:
+        import glob as _glob
+        d = os.path.dirname(tickfile_path)
+        prefix = os.path.basename(tickfile_path) + ".truncated."
+        backups = _glob.glob(os.path.join(d, prefix + "*"))
+        if len(backups) <= keep:
+            return
+        # newest by mtime; delete the oldest beyond `keep`
+        backups.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for stale in backups[keep:]:
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+    except Exception:
+        logger.debug("prune truncated backups failed (best-effort)", exc_info=True)
+
+
+def check_output_fs_local(output_dir: str) -> None:
+    """INV-CM-FS-CHECK-RUNTIME: reject network filesystems (nfs/cifs/9p/fuse.sshfs) at startup.
+    Production = local ext4/xfs. On non-POSIX (Windows dev/test) this is a no-op (M-R25-3).
+
+    Raises RuntimeError if output_dir resolves to a network fs on a POSIX host. Fails open
+    (logs + returns) when /proc/mounts is unreadable or has an unexpected format: the check
+    is a guardrail, not a hard dependency — unreadable mount info must not block startup.
+    """
+    if not _HAS_FCNTL:
+        # Non-POSIX (Windows dev/test): production is Linux; skip the check.
+        return
+    try:
+        abs_dir = os.path.abspath(output_dir)
+        # /proc/mounts lines: "<device> <mountpoint> <fstype> <options> <dump> <pass>"
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            mounts = []
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    mounts.append((parts[1], parts[2]))  # (mountpoint, fstype)
+        # find the longest mountpoint that is a prefix of abs_dir
+        best_mp = None
+        best_fstype = None
+        for mp, fstype in mounts:
+            if abs_dir == mp or abs_dir.startswith(mp + "/") or abs_dir.startswith(mp + os.sep):
+                if best_mp is None or len(mp) > len(best_mp):
+                    best_mp = mp
+                    best_fstype = fstype
+        rejected = {"nfs", "nfs4", "cifs", "9p", "fuse.sshfs"}
+        if best_fstype and best_fstype in rejected:
+            raise RuntimeError(
+                f"output_dir {output_dir!r} is on filesystem type {best_fstype!r}; "
+                f"tickfile commit-marker requires a local filesystem (ext4/xfs). "
+                f"Network filesystems break fcntl.flock + crash-consistency (INV-CM-FS-CHECK-RUNTIME)."
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        # /proc/mounts unreadable or unexpected format: fail open (log, don't block startup)
+        logger.debug("fs runtime check could not determine fs type for %s (fail open)", output_dir, exc_info=True)
+
+
 def _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker, has_sidecar_file, result):
     """Single-pass row scan + optional tail-strip. INV-CM-FAIL-ATOMIC: scan in try; mutate only after.
 
@@ -613,10 +691,27 @@ def _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker, has
     truncate_bytes = 0
     if enable_commit_marker and not has_sidecar_file:
         truncate_bytes = _tail_strip_partial_last_line(tickfile_path)
+    # INV-CM-SIDECAR-TAMPER-DETECT (T11): sidecar missing but tickfile is non-trivial AND has
+    # committed rows = possible tamper/accidental deletion. Override the audit `result` label
+    # (the row-scan + tail-strip above still run unchanged; only the label + a CRITICAL log fire).
+    # The size guard uses post-tail-strip state: if there is real data the size stays non-trivial.
+    if enable_commit_marker and (not has_sidecar_file) and committed_set:
+        try:
+            tf_size = os.path.getsize(tickfile_path)
+        except OSError:
+            tf_size = 0
+        if tf_size > TICKFILE_TAMPER_THRESHOLD_BYTES:
+            logger.critical(
+                "sidecar_missing_nontrivial_tickfile: %s has %d bytes but no usable sidecar "
+                "(possible tamper/accidental deletion); %d minutes reconstructed from rows",
+                tickfile_path, tf_size, len(committed_set),
+            )
+            result = "tamper"
     _write_recovery_audit(output_dir, date, had_sidecar=False,
                           committed_count=len(committed_set),
                           last_commit_minute=(max(committed_set) if committed_set else None),
                           truncate_bytes=truncate_bytes, result=result, fallback_mode=True)
+    _prune_truncated_backups(tickfile_path)  # INV-CM-RETENTION (best-effort)
     return (committed_set, last_seqno, False)
 
 
@@ -677,6 +772,7 @@ def _recover_tickfile_to_last_commit(output_dir: str, date: str, enable_commit_m
                                       committed_count=len(committed_set),
                                       last_commit_minute=max_rec[0],
                                       truncate_bytes=truncate_bytes, result=result)
+                _prune_truncated_backups(tickfile_path)  # INV-CM-RETENTION (best-effort)
                 return (committed_set, last_seqno, True)
 
     # --- fallback path ---
