@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import sys
 import threading
 from typing import Dict, List, Optional, Tuple
+
+try:
+    import fcntl as _fcntl  # POSIX only (production = Linux per M-R25-3)
+    _HAS_FCNTL = True
+except ImportError:
+    _fcntl = None
+    _HAS_FCNTL = False
+_IS_WINDOWS = sys.platform.startswith("win")
 
 from minute_bar.code_table import CodeTable
 from minute_bar.models import OHLCVAggregate, OrderRecord, SnapshotRecord
@@ -17,6 +27,10 @@ TICKFILE_MAX_ROW_BYTES = 640   # v11: Increased from 512. Pathological float rep
 TICKFILE_TAIL_READ_SIZE = 4096  # >6x TICKFILE_MAX_ROW_BYTES, covers truncated lines safely
 assert TICKFILE_TAIL_READ_SIZE >= TICKFILE_MAX_ROW_BYTES * 6, (
     "TAIL_READ_SIZE must be >= 6x MAX_ROW_BYTES for seek safety")
+
+# Commit-marker sidecar constants (Phase 23, commit-marker recovery)
+SIDECAR_TAIL_READ_SIZE = 65536   # full-day sidecar ~16KB; cap a tail read at 64KB (INV-CM-SIDECAR-MAXSIZE)
+MAX_SIDECAR_SIZE = 1 * 1024 * 1024  # 1MB sanity cap (normal ~16KB)
 
 
 def _fmt(value: float, decimal: int) -> str:
@@ -527,3 +541,114 @@ def extract_minutes_from_tickfile(path: str) -> set:
             if len(minute_key) == 12 and minute_key.isdigit():
                 present.add(minute_key)
     return present
+
+
+def _read_valid_sidecar(sidecar_path: str, date: str):
+    """Read & validate sidecar lines for `date`. Returns:
+      None  -> file missing (caller: treat as no-sidecar).
+      []    -> file present but zero valid lines (≡ missing, INV-CM-SIDECAR-EMPTY-EQUIV-MISSING).
+      [records] -> list of (minute, offset, rowcount, seqno), offset-strictly-increasing (INV-CM-OFFSET-MONO),
+                   date-filtered (INV-CM-DATE-FILTER)."""
+    if not os.path.exists(sidecar_path):
+        return None
+    records = []
+    last_offset = -1
+    try:
+        with open(sidecar_path, "r", encoding="utf-8", newline="") as f:
+            for line in f:
+                rec = _parse_commit_line(line)
+                if rec is None:
+                    continue
+                minute, offset, rowcount, seqno = rec
+                if not minute.startswith(date):
+                    logger.warning("Sidecar cross-date record skipped: %s (expected date %s)", minute, date)
+                    continue
+                if offset <= last_offset:
+                    logger.warning("Sidecar non-monotonic offset skipped: %d after %d", offset, last_offset)
+                    continue
+                last_offset = offset
+                records.append(rec)
+    except OSError:
+        logger.warning("Sidecar read failed: %s", sidecar_path, exc_info=True)
+        return []
+    return records
+
+
+@contextlib.contextmanager
+def _flock_critical_section(lockfile_path: str):
+    """Cross-process exclusive non-blocking flock for the with-block.
+    POSIX fcntl.flock(LOCK_EX|LOCK_NB); Windows dev/test = best-effort no-op (M-R25-3: prod is Linux).
+    Raises BlockingIOError if held by another process. fd lives for the whole block; close releases."""
+    with open(lockfile_path, "a") as lockfile_f:  # "a": create-if-absent, never truncate (LOCKFILE-IMMORTAL)
+        if _HAS_FCNTL:
+            _fcntl.flock(lockfile_f.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        else:
+            logger.debug("flock unavailable (non-POSIX); cross-process lock skipped for %s", lockfile_path)
+        try:
+            yield
+        finally:
+            pass  # fd close on with-exit releases the OFD flock
+
+
+def _sidecar_tail_last_record(sidecar_path: str, date: str):
+    """Tail-read the sidecar's last valid record (REGEN-GUARD precondition, ms-level).
+    Returns (minute, offset, rowcount, seqno) or None."""
+    try:
+        size = os.path.getsize(sidecar_path)
+    except OSError:
+        return None
+    if size == 0:
+        return None
+    if size > MAX_SIDECAR_SIZE:
+        logger.critical("Sidecar huge (%d bytes > %d); tail-reading last %d only",
+                        size, MAX_SIDECAR_SIZE, SIDECAR_TAIL_READ_SIZE)
+    tail = min(size, SIDECAR_TAIL_READ_SIZE)
+    try:
+        with open(sidecar_path, "rb") as f:
+            f.seek(-tail, 2)
+            data = f.read()
+    except OSError:
+        return None
+    last = None
+    for raw in reversed(data.split(b"\n")):
+        if not raw.strip():
+            continue
+        rec = _parse_commit_line(raw.decode("utf-8", errors="replace"))
+        if rec and rec[0].startswith(date):
+            last = rec
+            break
+    return last
+
+
+def _date_from_minute_key(minute_key: str) -> str:
+    return minute_key[:8]
+
+
+def _classify_append_precondition(current_minute_key: str, sidecar_path: str, tickfile_path: str):
+    """REGEN-GUARD predicate. Returns (kind, last_record):
+      ("new", None)              — sidecar missing/empty -> first write of the day.
+      ("committed", last_rec)    — sidecar last minute == current AND tickfile size == offset -> skip.
+      ("append", last_rec)       — last minute < current AND size == offset -> clean append.
+      ("truncate_rewrite", last_rec) — tickfile size > last offset -> uncommitted residue; truncate to offset then write.
+    last_record = (minute, offset, rowcount, seqno) of sidecar's last valid line."""
+    last_rec = _sidecar_tail_last_record(sidecar_path, _date_from_minute_key(current_minute_key))
+    if last_rec is None:
+        return ("new", None)
+    last_minute, last_offset = last_rec[0], last_rec[1]
+    try:
+        size = os.path.getsize(tickfile_path)
+    except OSError:
+        size = 0
+    if last_minute == current_minute_key:
+        if size == last_offset:
+            return ("committed", last_rec)
+        if size > last_offset:
+            return ("truncate_rewrite", last_rec)
+        return ("committed", last_rec)  # size < offset anomaly -> treat as committed (don't double-write)
+    # last_minute < current (normal) — or > current (anomaly)
+    if last_minute > current_minute_key:
+        logger.warning("Sidecar last minute %s > current %s (anomaly); treating as append",
+                       last_minute, current_minute_key)
+    if size > last_offset:
+        return ("truncate_rewrite", last_rec)
+    return ("append", last_rec)
