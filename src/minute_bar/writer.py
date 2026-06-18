@@ -484,3 +484,22 @@ def recover_tickfile_seqno(output_dir: str, minute_key: str) -> int:
     if last_valid_seqno > 0:
         logger.info("Tickfile seqno recovered: %s seqno=%d", path, last_valid_seqno)
     return last_valid_seqno
+
+
+def extract_minutes_from_tickfile(path: str) -> set:
+    """Read a per-day tickfile; return distinct minute_keys from the UpdateTime column (index 16).
+    Module-level (promoted from ReplayEngine) so writer.recovery + flusher fallback can call it
+    without importing replay (circular). Does NOT re-round the minute (m-R19-1)."""
+    present: set = set()
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        for line_num, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped or line_num == 1:
+                continue
+            fields = stripped.split(",")
+            if len(fields) != 65:
+                continue
+            minute_key = fields[16].replace(" ", "").replace(":", "")[:12]
+            if len(minute_key) == 12 and minute_key.isdigit():
+                present.add(minute_key)
+    return present

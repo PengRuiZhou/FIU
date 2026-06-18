@@ -13,6 +13,14 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "unit: fast pure-function tests",
+    "integration: multi-component tests",
+    "e2e: end-to-end engine/replay tests",
+    "slow: tests that take >2s or need subprocess",
+    "requires_pandas: needs pandas (dev dep; auto-skipped if absent)",
+    "requires_fcntl: needs POSIX fcntl.flock (skipped on Windows)",
+]
 
 [project.scripts]
 data-simulator = "data_simulator.__main__:main"

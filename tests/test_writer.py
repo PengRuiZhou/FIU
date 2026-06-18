@@ -613,3 +613,17 @@ class TestTickfileMaxRowBytesAssert:
     def test_runtime_assert_holds(self):
         from minute_bar.writer import TICKFILE_MAX_ROW_BYTES, TICKFILE_TAIL_READ_SIZE
         assert TICKFILE_TAIL_READ_SIZE >= TICKFILE_MAX_ROW_BYTES * 6
+
+
+def test_enable_tickfile_commit_marker_default_and_parsed(tmp_path):
+    from minute_bar.config import load_config
+    ini = tmp_path / "c.ini"
+    ini.write_text("[input]\ncsv_dir=x\n[output]\noutput_dir=y\n", encoding="utf-8")
+    cfg = load_config(str(ini))
+    assert cfg.recovery.enable_tickfile_commit_marker is True  # default ON
+    ini2 = tmp_path / "c2.ini"
+    ini2.write_text(
+        "[input]\ncsv_dir=x\n[output]\noutput_dir=y\n"
+        "[recovery]\nenable_tickfile_commit_marker = false\n", encoding="utf-8")
+    cfg2 = load_config(str(ini2))
+    assert cfg2.recovery.enable_tickfile_commit_marker is False

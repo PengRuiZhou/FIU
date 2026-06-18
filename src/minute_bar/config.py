@@ -71,6 +71,11 @@ class RecoveryConfig:
     # Production real-time: late records are minimal (<1000/min); this cap is a safety valve.
     # 100x speed test: busiest minute (0900) has ~750K records; 1M gives 33% headroom.
     max_late_order_records_per_minute: int = 1000000
+    # Tickfile commit-marker + truncate recovery (spec 2026-06-17).
+    # When True: write sidecar commit file + fcntl.flock; recover via sidecar + truncate.
+    # When False: legacy behavior (no sidecar/flock; row-based fallback recovery).
+    # Process-static: read once at __init__; change requires restart (INV-CM-KILLSWITCH-CONSISTENCY).
+    enable_tickfile_commit_marker: bool = True
 
 
 @dataclass
@@ -154,6 +159,9 @@ def load_config(path: str | Path) -> AppConfig:
         cfg.recovery.data_flush_delay_minutes = s.getint("data_flush_delay_minutes", cfg.recovery.data_flush_delay_minutes)
         cfg.recovery.enable_time_fallback = s.getboolean("enable_time_fallback", cfg.recovery.enable_time_fallback)
         cfg.recovery.stall_flush_sec = s.getint("stall_flush_sec", cfg.recovery.stall_flush_sec)
+        cfg.recovery.enable_tickfile_commit_marker = s.getboolean(
+            "enable_tickfile_commit_marker", cfg.recovery.enable_tickfile_commit_marker
+        )
         cfg.recovery.max_late_order_records_per_minute = s.getint(
             "max_late_order_records_per_minute",
             cfg.recovery.max_late_order_records_per_minute

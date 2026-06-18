@@ -60,24 +60,8 @@ class ReplayEngine:
 
     @staticmethod
     def _extract_minutes_from_tickfile(path: str) -> set:
-        """Read a per-day tickfile; return distinct minute_keys from the UpdateTime column."""
-        present: set = set()
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            for line_num, line in enumerate(f, start=1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if line_num == 1:
-                    continue  # header row — fields[16] is the literal 'UpdateTime'
-                fields = stripped.split(",")
-                if len(fields) != 65:
-                    continue  # corrupted/truncated line — skip (mirror recover_tickfile_seqno)
-                update_time = fields[16]
-                # Format "YYYYMMDD HH:MM:00" -> 12-char minute_key "YYYYMMDDHHMM"
-                minute_key = update_time.replace(" ", "").replace(":", "")[:12]
-                if len(minute_key) == 12 and minute_key.isdigit():
-                    present.add(minute_key)
-        return present
+        from minute_bar.writer import extract_minutes_from_tickfile
+        return extract_minutes_from_tickfile(path)
 
     def run(self) -> None:
         logger.info("Replay mode: loading data for date %s", self._date)
