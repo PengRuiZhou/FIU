@@ -1351,3 +1351,18 @@ Minor：日志关键字未固化为字面 grep token、降级 last_commit_minute
 
 ### Review log
 * `docs/superpowers/reviews/2026-06-17-tickfile-commit-marker-truncate-review-log.md`
+
+---
+
+## Implementation phase (2026-06-22)
+
+The design (26 spec-review rounds above) was implemented task-by-task (T0–T11) with two-stage (spec + code-quality) review per task, then holistic + adversarial verification:
+
+- **Per-task reviews**: all 12 tasks passed spec + quality review (a few nit fixups applied: dedup date helper, drop dead const, type hints, observability warnings).
+- **Holistic final review**: found + fixed cross-day OLD-date recovery targeting the wrong date (`jst_now` = new date at cross-day).
+- **3-agent deep review** (core correctness / integration-wiring / test-coverage): found + fixed (a) kill-switch leak on the live write path (`_try_generate_tickfile` omitted `enable_commit_marker`), (b) fallback recovery running truncate without the lock.
+- **Adversarial fault-injection workflow** (19 scenarios, real recovery code): found REGEN-GUARD 2A — the empty-sidecar crash window (tickfile fsync'd, sidecar write failed) → retry blind-appended duplicate rows (3/3 reproducible). Fixed with orphan-aware `_classify_append_precondition` (truncate current-minute block on retry, preserve legacy rows).
+- **Real E2E tests** (live+replay + live+live restart recovery): 3× stable PASS each, real dataSimulator+Engine+ReplayEngine.
+- **Correctness verification** (tickfile + slice + pipeline): ALL CORRECT — 8/8 + 6/6 + 4/4.
+
+Branch: `feat/tickfile-commit-marker-recovery` (22 commits from base `cf63902`). Full detail in the plan's Post-Implementation Log.

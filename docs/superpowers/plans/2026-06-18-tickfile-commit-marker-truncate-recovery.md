@@ -1,6 +1,7 @@
 # Tickfile Commit-Marker + Truncate Recovery — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **✅ IMPLEMENTED 2026-06-22** on branch `feat/tickfile-commit-marker-recovery` (22 commits from base `cf63902`). All tasks T0–T11 complete + MVP milestone reached. Post-implementation review/fix work, real E2E tests, and correctness verification are documented in the **Post-Implementation Log** section at the end of this file. Feature test suite: 70+ tests pass (+1 POSIX-only flock skip on Windows); full suite green except pre-existing unrelated failures.
 
 **Goal:** Give the per-day append-only tickfile crash-consistency equivalent to order/snapshot's atomic per-minute files, via a sidecar commit file + truncate-to-last-commit recovery, so a hard crash mid-append no longer leaves a permanently partial minute.
 
@@ -1622,3 +1623,28 @@ def test_tickfile_pure_csv_reader_no_hash_rows(tmp_path):
 - **MVP vs Full:** T0–T8 = MVP + engine + E2E (production-crash-recovery value). T9–T11 = Full (flock subprocess proof, pandas empirical, reconcile, tamper, fs-check, retention). All deferrable Full tasks are isolated.
 - **Known tension resolved:** recovery's return contract is `(committed_set, last_seqno, had_sidecar)`; fallback populates `committed_set` via single-pass scan (M-R23-2) so callers never double-scan. When `enable_commit_marker=False`, recovery still returns the row-scan fallback (so seqno + skip-set are correct) — C-R21-1's `(set(),0,False)` applies only to the `enable_tickfile=False` gate (no tickfile output).
 - **Risk:** the flusher `__init__` eager recovery (T5) + lazy-seqno deletion is the highest-risk integration change. Run `tests/test_tickfile_sync.py` + `tests/test_tickfile_bg_writer.py` after T5 and T7 — they exercise the writer-thread lifecycle most heavily.
+
+---
+
+## Post-Implementation Log (2026-06-22)
+
+Implementation followed this plan task-by-task (T0–T11) via subagent-driven development with two-stage (spec + code-quality) review per task. The following work happened AFTER the original task list, driven by holistic + adversarial review:
+
+### Fixes applied during/after implementation
+1. **Cross-day OLD-date recovery** (final holistic review): `_run_tickfile_recovery` called from `_tickfile_writer_pause` resolved the date via `jst_now_yyyymmdd()` = the NEW date at cross-day, so the OLD date's partial tail was never truncated. Fixed: `_step1_cross_day_check` now calls `_recover_tickfile_to_last_commit(output_dir, old_date)` before the state clear and DISCARDS the returned set (INV-CM-CROSSDAY-COMMITTED-DISCARD). [e30a69e]
+2. **Kill-switch leak on the live write path** (3-agent review): `_try_generate_tickfile` called `write_tickfile_rows(...)` without `enable_commit_marker=`, so `enable_tickfile_commit_marker=False` still wrote sidecars+flock on the live path while recovery fell back to row-scan — incoherent. Fixed: pass the flag (mirrors replay) + regression test. [038fb69]
+3. **Fallback recovery lock** (3-agent review): the pure-fallback path of `_recover_tickfile_to_last_commit` ran `_fallback_recover` (tail-strip/truncate) without `_get_write_lock`/flock. Fixed: wrapped in the same locks as the sidecar-mode path (INV-CM-LOCK, defense-in-depth). [038fb69]
+4. **fstat consistency + audit label + test hardening**: `_classify_append_precondition`/`_tail_strip_partial_last_line` now read tickfile size via `os.fstat` (INV-CM-OFFSET-FSTAT consistency); fallback tail-strip labels audit `result="truncate"` when bytes removed; +3 tests (fstat-source discrimination, cross-day force-gen retry, cross-day discard). [6824ecd]
+5. **REGEN-GUARD 2A orphan-retry duplicate** (adversarial fault injection, reproducible 3/3): a failure between the tickfile fsync and the sidecar append (the INV-CM-ORDERED-TWO-FILE window) could leave the sidecar EMPTY while the tickfile held the current minute's rows; retry then classified `("new")` and blind-appended → duplicate rows. Fixed: `_classify_append_precondition` now inspects the tickfile tail when the sidecar is empty — if the last row's minute == current (orphaned retry) it truncates the current-minute block and rewrites (no dup); if != current (legacy file / normal next minute) it appends normally, PRESERVING older rows. [f394634]
+
+### Real E2E tests [eede1dd]
+`tests/e2e_tickfile_restart_recovery.py` — real `data_simulator` (100Kx, bounded source slice of `D:/FIU/input`) + real `Engine` + real `ReplayEngine` + real `_recover_tickfile_to_last_commit`. NO mocks of engine/recovery/simulator.
+- `test_e2e_live_then_replay_restart_recovery` — live → stop → inject partial → ReplayEngine over full source: startup recovery truncates the partial, skips committed minutes (exact row counts preserved across restart), fills the gap. 3× stable PASS (~350s).
+- `test_e2e_live_then_live_restart_recovery` — live #1 → stop → inject partial → fresh live #2 (`__init__` eager recovery truncates + seeds skip-set) → resume: no duplicates across the restart. 3× stable PASS (~200s).
+- Side note: the live engine needs Phase-21 Rust acceleration flags to keep up with the 100Kx feed at the 0900 open peak; the bounded source slice is cached at `test/_e2e_slice` (gitignored under `test/`).
+
+### Correctness verification (2026-06-22)
+3-agent verification of the generated tickfile + E2E slice + pipeline coherence: **ALL CORRECT** (8/8 tickfile + 6/6 slice + 4/4 pipeline checks).
+- Tickfile (`test/phase21_benchmark/engine_out/.../tickfile_20260528.csv`): 49,555 rows (4505 × 11 minutes 0901–0911), 0 malformed/partial; sidecar 11 lines, every recorded rowcount (4505) matches actual, last offset 14,926,877 == file size; csv + pandas read cleanly.
+- Slice (`test/_e2e_slice`): order 7,052,694 rows (8 fields, all timestamps in 0900–0910), snapshot 531,231 rows (21 fields, in range), `code.csv` byte-identical to original, 10/10 sampled rows found verbatim in the original input; no boundary half-rows.
+- Pipeline: tickfile symbols ⊆ source snapshot per minute (carry-forward makes tickfile a per-minute superset — expected); one tickfile row traced back to its source snapshot/order rows; all 11 minutes fully backed; 0 phantom symbols (all 4505 tickfile InstrumentIDs present in `code.csv`).
