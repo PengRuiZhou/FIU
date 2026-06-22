@@ -1078,3 +1078,32 @@ E2E 讨论暴露**硬崩溃 mid-append gap**：tickfile 是 per-day append（非
 - **replay + live 重启都调**（彻底恢复）；老文件（无 marker）降级 row-based 兼容。
 - 方案 A（per-minute 原子文件）因布局 breaking 被否决；`.tmp→append` 因 append 非原子被否决。
 - 待：写 plan → 实施。
+
+## Session 27 — 2026-06-22 (Tickfile Commit-Marker + Truncate 恢复：实施 + 审查修复 + 真 E2E + 验证)
+
+### ✅ 实施（subagent-driven，T0-T11，每任务两阶段 review）
+方案 B sidecar 终版（26 轮 spec review 后，in-file `#COMMIT` marker 废弃改 sidecar，保 csv/pandas 纯净）。
+- **write path**：`write_tickfile_rows` 加 flock+sidecar+REGEN 四分支（new/append/truncate_rewrite/committed-skip），tickfile rows fsync → fstat offset → sidecar fsync（提交点）。
+- **recovery**：`_recover_tickfile_to_last_commit` 读 sidecar → truncate 到 max offset（+备份+audit）→ 返回 `(committed_set, last_seqno, had_sidecar)`；fallback 单遍 row-scan + tail-strip + tamper 检测。
+- **接线**：flusher `__init__` 急切 recovery（取代 3 lazy seqno）；`_run_tickfile_recovery`（runtime）；replay `run()`；`_step1_cross_day_check` 旧日 recovery；config kill-switch `enable_tickfile_commit_marker`；engine health-check/drain/pause 调 recovery；cross-day force-gen retry。
+- **Full**：reconcile（CRITICAL 检测）、tamper 检测、fs runtime check（拒 nfs/cifs）、`.truncated.*` retention、flock 子进程测试、pandas 实证测试。
+- 提交链 T0-T11：`12ae775 → 77d2095`（+ plan doc `19ca118`）。
+
+### 审查/修复（post-impl）
+- **final holistic review** → 跨天旧日 recovery 用错日期（`_run_tickfile_recovery` jst_now=新日）→ `_step1_cross_day_check` 显式 recover 旧日 discard set。[`e30a69e`]
+- **3-agent deep review**（core/integration/tests）→ ①live 写路径 kill-switch 泄漏（`_try_generate_tickfile` 没传 `enable_commit_marker`）→ 补；②fallback recovery tail-strip 漏锁 → 补双锁。[`038fb69`]；+ fstat 一致性/审计标签/3 测试加固 [`6824ecd`]。
+- **adversarial 故障注入 workflow**（19 场景）→ **REGEN 2A**（tickfile fsync 后 sidecar 写前崩→sidecar 空→重试盲目 append 重复，3/3 复现）→ `_classify_append_precondition` sidecar 空时按 tickfile 末行 minute 判孤儿截断（保 legacy）。[`f394634`]
+
+### ✅ 真 E2E（`tests/e2e_tickfile_restart_recovery.py`，[`eede1dd`]）
+dataSimulator(100Kx, bounded slice of D:/FIU/input) + 真 Engine + 真 ReplayEngine + 真 recovery，无 mock：
+- `test_e2e_live_then_replay_restart_recovery`：live→stop→注入 partial→Replay 全量源 → recovery 截 partial + 跳过已 commit（行数逐一不变）+ 填 gap。3× PASS（~350s）。
+- `test_e2e_live_then_live_restart_recovery`：live#1→stop→注入 partial→全新 live#2（`__init__` 急切 recovery 截 partial+seed skip-set）→续跑 → 跨重启无重复。3× PASS（~200s）。
+- 注：live 引擎需 Phase-21 Rust 加速标志才跟得上 100Kx 的 0900 开盘峰值；slice 缓存 `test/_e2e_slice`（gitignored）。
+
+### ✅ 正确性验证（3-agent：tickfile + slice + pipeline，全 CORRECT）
+- tickfile：49,555 行（4505×11），0 malformed/partial，sidecar rowcount 全对账，末 offset==size，csv/pandas 干净。
+- slice：order 705 万行/snapshot 53 万行 ts 全在 0900-0910，code 字节同原件，10/10 抽样 verbatim，无边界半行。
+- pipeline：tickfile symbol⊆源/分钟（carry-forward 超集，预期），0 phantom（4505 全在 code.csv），单行可溯源。
+
+### 文档同步
+spec/plan/review-log/memory 全部更新到"已实施+验证"状态；本 task_plan/findings/progress 同步。Branch `feat/tickfile-commit-marker-recovery`（23 commits，base `cf63902`）。

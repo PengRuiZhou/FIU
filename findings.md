@@ -1186,3 +1186,29 @@ spec 原称"is_trading_minute 过滤 1531"是**错的**——`is_trading_minute`
 - kill 永远发生在 in-progress 的下一分钟（gap 分钟），不损坏断点分钟（已原子 flush）。
 - E2E 实证：断点 0931 symbol 覆盖 4505（全集）+ 采样比率 9.9×（与完整分钟 0930 的 10.3× 一致）→ 完整。
 - order 文件行数 ~每分钟每 symbol 每 batch 一条（聚合视图，非源 tick 1:1）——源 436K tick → order 文件 ~44K 行是正常采样。
+
+## Tickfile Commit-Marker 实施+验证发现（2026-06-22，Session 27）
+
+### Finding 14: sidecar 终版取代 in-file `#COMMIT` marker（csv/pandas 兼容）
+- 26 轮 review 后，原 in-file `#COMMIT,<minute>,<count>` marker **废弃**——破坏 csv 格式（pandas 不跳 `#`、csv.reader 字段错位）。
+- 改 **sidecar `tickfile_{date}.csv.commit`**（下游不读），tickfile 保持纯净 65 字段。提交点 = sidecar 行 fsync（tickfile rows 先 fsync，INV-CM-ORDERED-TWO-FILE）。
+- INV-CM-MONO：sidecar 行落盘 ⟺ 该分钟 tickfile 数据完整落盘。3 个文件：`.csv`（数据）/ `.csv.commit`（sidecar 提交日志）/ `.csv.lock`（flock 按日期锁文件，0 字节）。
+
+### Finding 15: REGEN-GUARD 四分支 + 2A 孤儿重试（故障注入 3/3 复现）
+- `_classify_append_precondition` = (sidecar 末行 minute, tickfile size vs offset) 二元四分支：new/append/truncate_rewrite/committed-skip。
+- **2A 漏洞**：INV-CM-ORDERED-TWO-FILE 窗口（tickfile fsync 后、sidecar 写前）若崩留 sidecar 空 → 重试 classify 当 "new" 盲目 append → 重复。故障注入 workflow 3/3 复现。
+- **修复**：sidecar 空时查 tickfile 末行 minute——==current（孤儿重试）截断当前分钟块重写；!=current（legacy/正常下一分钟）正常 append 保老行。避开了"截到 header 误删 legacy"的数据丢失。
+
+### Finding 16: kill-switch + flock 按日期 + 单进程前提
+- `enable_tickfile_commit_marker=False`：write 跳 sidecar/flock，recovery 降级 row-scan。**漏过 live 写路径**（`_try_generate_tickfile` 没传 flag）→ 3-agent 审查发现并修。
+- flock 按日期 lockfile（`tickfile_{date}.csv.lock`）→ 不同日期不争用（live 今天 + replay 历史并行安全）；同日第二写者 `LOCK_EX|LOCK_NB` → BlockingIOError abort（非等待）。INV-CM-SINGLEPROC：同 output_dir 同日只一个写者。
+
+### Finding 17: recovery 三入口 + seqno 单调 + 跨天旧日
+- recovery 三处调：flusher `__init__`（live 重启，急切）、`_run_tickfile_recovery`（runtime 自愈）、replay `run()`。
+- seqno 用 `max(file, mem)`（INV-CM-SEQNO-MONO-FILE）防回退。
+- 跨天：`_step1_cross_day_check` clear 前显式 recover **旧日**（discard 返回 set，不污染 live skip-set）；jst_now 在跨天瞬间是新日，不能用它 recover 旧日（初版 bug，已修）。
+
+### Finding 18: 正确性实证（tickfile + slice + pipeline 全 CORRECT）
+- 生成 tickfile：49,555 行 = 4505 symbol × 11 分钟（0901-0911），0 malformed，sidecar 11 行 rowcount 全 == 4505，末 offset 14,926,877 == 文件大小。
+- E2E slice（裁剪自 D:/FIU/input，[0900..0910]）：order 705 万行 8 字段、snapshot 53 万行 21 字段、ts 全在窗内、code 字节同原件、10/10 抽样 verbatim 命中、无边界半行。
+- pipeline：tickfile 每分钟 symbol ⊆ 源 snapshot（carry-forward 使 tickfile 是超集，预期）；0 phantom（4505 全在 code.csv）。

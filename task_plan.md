@@ -14,6 +14,8 @@
 - `docs/superpowers/specs/2026-05-27-order-write-performance-design.md`（Order 线程性能优化）
 - `docs/superpowers/specs/2026-06-01-tickfile-generation-design.md`（Tickfile 生成设计，Round 14，15 轮审阅通过）
 - `docs/superpowers/specs/2026-06-03-tickfile-sync-design.md`（Tickfile 同步生成设计，Phase 17）
+- `docs/superpowers/specs/2026-06-17-tickfile-commit-marker-truncate-recovery-design.md`（Tickfile Commit-Marker + Truncate 恢复，方案 B sidecar 终版，26 轮审阅，✅ 已实施）
+- `docs/superpowers/plans/2026-06-18-tickfile-commit-marker-truncate-recovery.md`（Commit-Marker 实施计划，T0-T11 + post-impl log）
 - `docs/superpowers/specs/2026-06-04-tickfile-bg-writer-design.md`（Tickfile Background Writer + Seek Optimization，Phase 18，v11）
 
 ---
@@ -944,7 +946,7 @@ PYTHONPATH=src python main.py --config config/config.ini
 
 ---
 
-## Phase 23: Q1 Tickfile Stale-Fix `[complete]` + Commit-Marker `[planned]`
+## Phase 23: Q1 Tickfile Stale-Fix `[complete]` + Commit-Marker `[complete]`
 
 ### Phase 23a: Q1 stale-fix `[complete]`（2026-06-17，方案 A）
 - **Bug**: shutdown/cross-day 强制生成 order 未到的 tickfile 分钟 → stale carry-forward 行（永久残留）。
@@ -955,9 +957,13 @@ PYTHONPATH=src python main.py --config config/config.ini
 - **提交**: `a6f3c03 → 29439ce` + CHECK-1 fix `cba33c4`。
 - **Spec**: `2026-06-16-tickfile-stale-fix-design.md`。
 
-### Phase 23b: Commit-Marker + Truncate 恢复 `[planned]`（2026-06-17，方案 B，未实施）
+### Phase 23b: Commit-Marker + Truncate 恢复 `[complete]`（2026-06-22，方案 B sidecar 终版）
 - **Bug**: 硬崩溃 mid-append → tickfile（per-day append，非原子）部分分钟；replay 二值扫描跳过 → 永久部分缺失；append-only 无法干净补（重复）。
-- **Fix**: 每分钟 rows+fsync 后写 `#COMMIT,<minute>,<count>` marker；共享 `_recover_tickfile_to_last_commit()` truncate 到最后合法 marker + 返回 committed 集；**replay + live 重启都调**；老文件（无 marker）降级 row-based。
-- **否决**: 方案 A（per-minute 原子文件，布局 breaking）；`.tmp→append`（append 非原子）。
-- **Spec**: `2026-06-17-tickfile-commit-marker-design.md`（commit `26967f5`）。
-- **待**: writing-plans → subagent-driven 实施。
+- **最终设计（sidecar，26 轮 review 后修订；原 in-file `#COMMIT` marker 废弃——破坏 csv/pandas）**：tickfile 保持纯净（65 字段）；提交点放 **sidecar `tickfile_{date}.csv.commit`**，每行 `<minute>,<offset>,<rowcount>,<seqno>`。写一分钟：tickfile rows append+fsync → fstat offset → sidecar append+fsync（=提交点），全程 `_get_write_lock` + `fcntl.flock`（按日期 lockfile，Linux 生产）双锁。`_recover_tickfile_to_last_commit()` 读 sidecar（KB 级）→ truncate 到 max offset（+`.truncated.*` 备份 + best-effort JSONL audit）→ 返回 `(committed_set, last_seqno, had_sidecar)`；sidecar 缺/非法 → 单遍 row-scan 降级。
+- **接线**：flusher `__init__` 急切 recovery（INV-CM-ORDER-1，取代 3 个 lazy seqno 入口）；`_run_tickfile_recovery`（runtime，engine health-check/drain/pause 调）；replay `run()`；`_step1_cross_day_check` 旧日 recovery（clear 前，discard set）。kill-switch `RecoveryConfig.enable_tickfile_commit_marker`。
+- **实施**：subagent-driven，T0-T11（config + 纯函数 + write path REGEN 四分支 + recovery + flusher/replay 接线 + engine 自愈 + E2E + flock/pandas 测试 + reconcile + tamper/fs-check/retention），每任务两阶段 review。
+- **审查/修复（post-impl）**：①跨天旧日 recovery 用错日期（jst_now=新日）→ 显式 recover 旧日；②live 写路径 kill-switch 泄漏（`_try_generate_tickfile` 没传 `enable_commit_marker`）→ 补；③fallback recovery tail-strip 漏锁 → 补双锁；④tickfile size 读统一 fstat；⑤**REGEN 2A**（故障注入 3/3 复现）：tickfile fsync 后 sidecar 写前崩 → sidecar 空 → 重试盲目 append 重复 → `_classify_append_precondition` sidecar 空时查 tickfile 末行 minute，==current 截断孤儿块重写（保 legacy），!=current 正常 append。
+- **真 E2E**（`tests/e2e_tickfile_restart_recovery.py`，dataSimulator 100Kx + 真 Engine + 真 ReplayEngine）：`live+replay` 与 `live+live` 重启恢复各 3× PASS。
+- **正确性验证**（2026-06-22，3-agent）：生成 tickfile（4505×11 行/0 malformed/sidecar rowcount 全匹配/末 offset==size）+ slice（order 705 万行·snapshot 53 万行 ts 全在 0900-0910/code 字节同/抽样 verbatim）+ pipeline（symbol⊆源/0 phantom）**全 CORRECT**。
+- **生产拓扑**：live 重启自愈今天；历史天 `replay --date=`；live(今天)+replay(历史) 不同 per-day 文件不冲突；flock 同日第二写者 abort（INV-CM-SINGLEPROC）。
+- **Spec**: `2026-06-17-tickfile-commit-marker-truncate-recovery-design.md`；**Plan**: `2026-06-18-tickfile-commit-marker-truncate-recovery.md`；**Branch**: `feat/tickfile-commit-marker-recovery`（23 commits，base `cf63902`）。
