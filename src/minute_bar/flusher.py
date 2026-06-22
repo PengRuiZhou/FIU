@@ -747,7 +747,9 @@ class ClockWatermarkFlusher:
                     self._state._generated_tickfile_minutes.add(minute_key)
                 return
 
-            write_tickfile_rows(self._output_dir, minute_key, selected, current_seqno, code_table_getter=code_getter)
+            write_tickfile_rows(self._output_dir, minute_key, selected, current_seqno,
+                                code_table_getter=code_getter,
+                                enable_commit_marker=self._enable_tickfile_commit_marker)
 
             # Post-write verification (warning only — do NOT re-insert on failure)
             path = get_tickfile_path(self._output_dir, minute_key)

@@ -982,3 +982,41 @@ def test_crossday_old_date_recovery_truncates_partial(tmp_path):
     assert os.path.getsize(tf) == committed_off          # old-date partial truncated
     assert b"OLD_DATE_PARTIAL_TAIL" not in open(tf, "rb").read()
 
+
+def test_killswitch_false_live_write_no_sidecar(tmp_path):
+    """INV-CM-KILLSWITCH-CONSISTENCY: with enable_tickfile_commit_marker=False, the LIVE write path
+    (_try_generate_tickfile) must NOT create a sidecar or flock — not just recovery. Regression for the
+    flusher._try_generate_tickfile write_tickfile_rows(...) call that previously omitted the flag
+    (so the kill-switch correctly no-op'd recovery via row-scan, but the live writer still emitted
+    sidecars + acquired flock — an incoherent kill-switch state)."""
+    import os
+    from unittest.mock import patch
+
+    from minute_bar.aggregator import SharedState
+    from minute_bar.checkpoint import CheckpointManager
+    from minute_bar.code_table import CodeTable
+    from minute_bar.flusher import ClockWatermarkFlusher
+    from minute_bar.writer import get_tickfile_path
+    from tests.test_tickfile_sync import _make_snapshot
+
+    state = SharedState()
+    state.first_data_received = True
+    # Construct flusher with the kill-switch OFF.
+    with patch("minute_bar.flusher.jst_now_yyyymmdd", return_value="20260602"):
+        flusher = ClockWatermarkFlusher(
+            state=state, code_table=CodeTable("dummy"), checkpoint=CheckpointManager("dummy", {}),
+            output_dir=str(tmp_path), output_delay_sec=60, enable_order=True, enable_tickfile=True,
+            enable_tickfile_commit_marker=False,
+        )
+    mk = "202606020931"
+    # Seed pending data the way _try_generate_tickfile expects (mirror production dict shape).
+    snap = _make_snapshot()
+    state._tickfile_pending[mk] = {"raw_records": {"7203": [snap]}, "snapshot_copy": {"7203": snap}}
+    state._tickfile_seqno = 0
+    flusher._try_generate_tickfile(mk)
+    tf = get_tickfile_path(str(tmp_path), mk)
+    assert os.path.exists(tf)                     # tickfile written
+    assert not os.path.exists(tf + ".commit")     # NO sidecar (kill-switch off)
+    assert not os.path.exists(tf + ".lock")       # NO lockfile created via flock path
+    assert mk in state._generated_tickfile_minutes
+

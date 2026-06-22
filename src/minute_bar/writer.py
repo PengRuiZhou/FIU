@@ -775,8 +775,14 @@ def _recover_tickfile_to_last_commit(output_dir: str, date: str, enable_commit_m
                 _prune_truncated_backups(tickfile_path)  # INV-CM-RETENTION (best-effort)
                 return (committed_set, last_seqno, True)
 
-    # --- fallback path ---
-    return _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker, has_sidecar_file, "fallback")
+    # --- fallback path (lock-protected: INV-CM-LOCK) ---
+    # _fallback_recover may tail-strip (path-based os.truncate); hold the same locks the
+    # sidecar-mode path uses so any mutation is consistent with the cross-process flock contract.
+    # Pure defense-in-depth: the writer thread is dead at every recovery call site.
+    with _get_write_lock(tickfile_path):
+        with _flock_critical_section(lockfile_path) if enable_commit_marker else _nullctx():
+            return _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker,
+                                     has_sidecar_file, "fallback")
 
 
 def extract_minutes_from_tickfile(path: str) -> set:
