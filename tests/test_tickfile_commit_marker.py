@@ -1020,3 +1020,133 @@ def test_killswitch_false_live_write_no_sidecar(tmp_path):
     assert not os.path.exists(tf + ".lock")       # NO lockfile created via flock path
     assert mk in state._generated_tickfile_minutes
 
+
+def test_commit_offset_uses_fstat_not_path_stat(tmp_path, monkeypatch):
+    """INV-CM-OFFSET-FSTAT: the sidecar commit offset is read via os.fstat(fd).st_size,
+    not os.path.getsize. Patch getsize to a wrong value; the offset must still equal the real size."""
+    import os as _os
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path, _parse_commit_line
+    from tests.test_tickfile_sync import _make_snapshot
+
+    real_stat = _os.stat
+
+    def wrong_getsize(path):
+        # Deliberately wrong for any path; if the offset used getsize it would be 999999.
+        return 999999
+
+    monkeypatch.setattr(_os.path, "getsize", wrong_getsize)
+    # FIRST write -> atomic-create path (no append tail-check), so the only size read for the
+    # offset is _fstat_size (fstat). Use a real SnapshotRecord so the row is a valid 65-field row.
+    write_tickfile_rows(str(tmp_path), "202605280931", [("7203", _make_snapshot(), None)], 1,
+                        enable_commit_marker=True)
+    tf = get_tickfile_path(str(tmp_path), "202605280931")
+    real_size = real_stat(tf).st_size  # os.stat (NOT patched) -> authoritative real size
+    with open(tf + ".commit") as f:
+        rec = _parse_commit_line(f.readline())
+    assert rec is not None
+    assert rec[1] == real_size       # offset == real fstat size, NOT the patched 999999
+    assert rec[1] != 999999
+
+
+def test_crossday_forcegen_retry_once(tmp_path, caplog):
+    """INV-CM-CROSSDAY-FORCEGEN-RETRY: when cross-day force-gen of a pending minute FAILS,
+    it is retried exactly once, and the SECOND failure emits a CRITICAL log (no infinite loop).
+
+    Drives the full _step1_cross_day_check path with _try_generate_tickfile monkeypatched to
+    always raise. _engine_ref is left None (so pause/resume are no-ops). The pending minute is
+    gated into generate_keys via order_current_minute >= minute_key."""
+    import logging
+    from unittest.mock import patch
+    from minute_bar.aggregator import SharedState
+    from minute_bar.checkpoint import CheckpointManager
+    from minute_bar.code_table import CodeTable
+    from minute_bar.flusher import ClockWatermarkFlusher
+
+    state = SharedState()
+    # Cross-day preconditions (see _step1_cross_day_check):
+    state.first_data_received = True
+    state.current_minute = "202606030900"          # NEW date
+    state.last_output_date = "20260602"              # OLD date (triggers the cross-day branch)
+    state.order_current_minute = "202606021600"      # >= pending mk -> force-gen gate includes it
+    # An OLD-date pending minute that force-gen will attempt (and re-attempt) to generate.
+    state._tickfile_pending["202606021500"] = {
+        "raw_records": {}, "snapshot_copy": {},
+    }
+
+    # Construct flusher. _engine_ref stays None -> pause/resume no-ops.
+    with patch("minute_bar.flusher.jst_now_yyyymmdd", return_value="20260603"):
+        flusher = ClockWatermarkFlusher(
+            state=state, code_table=CodeTable("dummy"), checkpoint=CheckpointManager("dummy", {}),
+            output_dir=str(tmp_path), output_delay_sec=60, enable_order=True, enable_tickfile=True,
+        )
+
+    # Spy: count how many times _try_generate_tickfile is invoked; always raise.
+    call_count = {"n": 0}
+
+    def failing_generate(minute_key):
+        call_count["n"] += 1
+        raise IOError("simulated force-gen failure")
+
+    flusher._try_generate_tickfile = failing_generate
+
+    with caplog.at_level(logging.CRITICAL):
+        flusher._step1_cross_day_check()
+
+    # Retried exactly once: first attempt + 1 retry = 2 total calls, then CRITICAL (not 3+).
+    assert call_count["n"] == 2, f"expected exactly 2 attempts (retry-once), got {call_count['n']}"
+    assert any("Cross-day tickfile force-gen FAILED twice" in r.message for r in caplog.records), \
+        "expected CRITICAL log for second force-gen failure"
+
+
+def test_crossday_discards_old_date_committed_set(tmp_path, caplog):
+    """INV-CM-CROSSDAY-COMMITTED-DISCARD: recovering the OLD date at cross-day must NOT pollute
+    the live skip-set with old-date minutes. The old-date tickfile IS truncated (recovery ran),
+    but its committed minutes are discarded (not added to _generated_tickfile_minutes).
+
+    Drives the full _step1_cross_day_check path with a real OLD-date tickfile + sidecar on disk.
+    After the cross-day reset, the OLD-date minute must be absent from _generated_tickfile_minutes
+    AND the old-date tickfile must be truncated back to its committed offset."""
+    import logging
+    from unittest.mock import patch
+    from minute_bar.aggregator import SharedState
+    from minute_bar.checkpoint import CheckpointManager
+    from minute_bar.code_table import CodeTable
+    from minute_bar.flusher import ClockWatermarkFlusher
+    from minute_bar.writer import get_tickfile_path
+
+    old_date = "20260602"
+    old_mk = f"{old_date}1500"
+
+    # Seed an OLD-date tickfile with a committed minute + a partial (uncommitted) tail.
+    tf = get_tickfile_path(str(tmp_path), f"{old_date}0000")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    committed_body = TICKFILE_HEADER + "\n" + ("a" * 60) + "\n"
+    committed_off = len(committed_body.encode())
+    with open(tf, "wb") as f:
+        f.write(committed_body.encode() + b"OLD_DATE_PARTIAL_TAIL")
+    with open(tf + ".commit", "w") as f:
+        f.write(f"{old_mk},{committed_off},1,330\n")
+
+    state = SharedState()
+    # Cross-day preconditions: NEW current date, OLD last_output_date.
+    state.first_data_received = True
+    state.current_minute = "202606030900"          # NEW date
+    state.last_output_date = old_date               # OLD date
+
+    with patch("minute_bar.flusher.jst_now_yyyymmdd", return_value="20260603"):
+        flusher = ClockWatermarkFlusher(
+            state=state, code_table=CodeTable("dummy"), checkpoint=CheckpointManager("dummy", {}),
+            output_dir=str(tmp_path), output_delay_sec=60, enable_order=True, enable_tickfile=True,
+        )
+
+    with caplog.at_level(logging.INFO):
+        flusher._step1_cross_day_check()
+
+    # INV-CM-CROSSDAY-COMMITTED-DISCARD: the OLD-date minute must NOT enter the live skip-set.
+    assert old_mk not in state._generated_tickfile_minutes, \
+        "old-date recovered minute leaked into live skip-set"
+    # Recovery DID run: the OLD-date partial tail was truncated back to the committed offset.
+    assert os.path.getsize(tf) == committed_off
+    assert b"OLD_DATE_PARTIAL_TAIL" not in open(tf, "rb").read()
+
+

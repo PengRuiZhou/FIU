@@ -330,8 +330,10 @@ def _nullctx():
     yield None
 
 
-def _fstat_size_after(path: str) -> int:
-    """Read post-write size via fstat on a fresh fd (INV-CM-OFFSET-FSTAT)."""
+def _fstat_size(path: str) -> int:
+    """Read a file's size via fstat on a fresh fd (INV-CM-OFFSET-FSTAT: avoids stale path-stat
+    on network fs). Used for post-durability commit offsets and tickfile-size reads that anchor
+    truncation."""
     with open(path, "rb") as f:
         return os.fstat(f.fileno()).st_size
 
@@ -400,7 +402,7 @@ def write_tickfile_rows(
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
                     raise
-                offset = _fstat_size_after(path)
+                offset = _fstat_size(path)
             else:
                 with open(path, "rb") as f:
                     first_line = f.readline().decode("utf-8", errors="replace").strip()
@@ -420,7 +422,7 @@ def write_tickfile_rows(
                             if os.path.exists(tmp_path):
                                 os.remove(tmp_path)
                             raise
-                        offset = _fstat_size_after(path)
+                        offset = _fstat_size(path)
                     else:
                         raise IOError(f"Tickfile header corrupted, cannot append: {path}")
                 else:
@@ -554,7 +556,7 @@ def _tail_strip_partial_last_line(tickfile_path: str) -> int:
     """INV-CM-FALLBACK-STRIP: if the last line isn't a complete 65-field data row,
     truncate the file back to the last '\\n' boundary. Returns bytes stripped."""
     try:
-        size = os.path.getsize(tickfile_path)
+        size = _fstat_size(tickfile_path)
     except OSError:
         return 0
     if size == 0:
@@ -707,6 +709,8 @@ def _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker, has
                 tickfile_path, tf_size, len(committed_set),
             )
             result = "tamper"
+    if truncate_bytes > 0 and result == "fallback":
+        result = "truncate"
     _write_recovery_audit(output_dir, date, had_sidecar=False,
                           committed_count=len(committed_set),
                           last_commit_minute=(max(committed_set) if committed_set else None),
@@ -894,7 +898,7 @@ def _classify_append_precondition(current_minute_key: str, sidecar_path: str, ti
         return ("new", None)
     last_minute, last_offset = last_rec[0], last_rec[1]
     try:
-        size = os.path.getsize(tickfile_path)
+        size = _fstat_size(tickfile_path)
     except OSError:
         size = 0
     if last_minute == current_minute_key:
