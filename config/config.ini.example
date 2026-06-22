@@ -8,7 +8,15 @@ poll_interval_ms = 200
 idle_poll_interval_ms = 5000
 buffer_poll_interval_ms = 1000
 chunk_size_bytes = 65536
+# Order chunk 大小（生产建议 524288，减少 GIL 重入点）
+order_chunk_size_bytes = 524288
 file_encoding = utf-8
+# Rust 加速 order CSV 解析（默认 false；置 true 但扩展缺失 → 启动 fail-fast）
+enable_order_accel = false
+# Rust 全管线（细粒度开关，需先 enable_order_accel=true）
+enable_rust_order_full_batch = false
+enable_rust_snapshot_batch = false
+enable_rust_tickfile = false
 
 [output]
 output_dir = /path/to/output
@@ -17,6 +25,8 @@ enable_kline = false
 enable_full_snapshot = true
 enable_full_kline = false
 enable_order = true
+# tickfile（每天一个 append）需 enable_order=true
+enable_tickfile = false
 
 [aggregation]
 first_seen_volume_base = start_totalvol
@@ -40,6 +50,8 @@ code_refresh_sec = 30
 data_flush_delay_minutes = 1
 enable_time_fallback = false
 stall_flush_sec = 300
+# tickfile sidecar commit + flock + truncate recovery 总开关（默认 true）
+enable_tickfile_commit_marker = true
 # Maximum late order records per minute before discarding.
 # Applies to ALL modes (live, replay, tickfile enabled or disabled).
 # Default: 1000000 (1M). Each record uses ~300-400 bytes of Python memory.

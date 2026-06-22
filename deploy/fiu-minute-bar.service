@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=rpeng
 WorkingDirectory=/home/rpeng/fiu_minute_bar
+Environment=PYTHONPATH=src
 ExecStart=/home/prod/anaconda3/bin/python main.py --config config/production.ini
 
 # Graceful shutdown: SIGTERM → 30s → SIGKILL

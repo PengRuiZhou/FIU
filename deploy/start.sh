@@ -21,6 +21,8 @@ fi
 
 echo "Starting FIU Minute Bar Generator..."
 cd "${APP_DIR}"
+# Pre-flight: ensure the Rust extension is importable (build via setup.sh if missing)
+PYTHONPATH=src ${PYTHON} -c "from minute_bar import _order_accel" || { echo "ERROR: Rust extension _order_accel missing — run setup.sh first"; exit 1; }
 PYTHONPATH=src nohup ${PYTHON} main.py --config "${CONFIG}" \
     >> "${LOG_DIR}/startup.log" 2>&1 &
 echo $! > "${PID_FILE}"

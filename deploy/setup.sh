@@ -34,12 +34,18 @@ chmod +x "${APP_DIR}/deploy/restart.sh"
 echo "Verifying Python..."
 ${PYTHON} -c "import sys; print(f'Python {sys.version}')"
 
-# 5. Verify config
+# 5. Build Rust extension (_order_accel) — engine imports minute_bar._order_accel
+echo "Building Rust extension (_order_accel)..."
+pip install setuptools-rust || { echo "ERROR: setuptools-rust install failed"; exit 1; }
+pip install . || { echo "ERROR: Rust extension build failed (pip install .)"; exit 1; }
+PYTHONPATH=src ${PYTHON} -c "from minute_bar import _order_accel; print('Rust ext OK')" || { echo "ERROR: _order_accel not importable after build"; exit 1; }
+
+# 6. Verify config
 echo "Verifying config..."
 cd "${APP_DIR}"
 PYTHONPATH=src ${PYTHON} -c "from minute_bar.config import load_config; load_config('config/production.ini'); print('Config OK')"
 
-# 6. Optional: install as systemd service
+# 7. Optional: install as systemd service
 read -p "Install as systemd service? [y/N] " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then

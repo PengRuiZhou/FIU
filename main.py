@@ -7,11 +7,26 @@ import argparse
 import logging
 import logging.handlers
 import os
+import signal
 import sys
 
 from minute_bar.config import load_config
 from minute_bar.engine import Engine
 from minute_bar.replay import ReplayEngine
+
+
+def _handle_stop_signal(signum, frame):
+    """Translate SIGTERM (and SIGINT) to KeyboardInterrupt so engine.start()'s
+    except-KeyboardInterrupt path runs the graceful stop (flush + tickfile drain +
+    commit-marker finalize). Without this, stop.sh / systemd SIGTERM force-kills
+    the process and the commit-marker finalization never runs."""
+    raise KeyboardInterrupt
+
+
+def install_stop_signal_handler() -> None:
+    """Register SIGTERM → KeyboardInterrupt so deploy stop (stop.sh / systemd)
+    triggers graceful shutdown. Idempotent."""
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
 
 
 def setup_logging(config) -> None:
@@ -61,6 +76,8 @@ def main() -> None:
     logger = logging.getLogger(__name__)
     logger.info("Input dir: %s", config.input.csv_dir)
     logger.info("Output dir: %s", config.output.output_dir)
+
+    install_stop_signal_handler()
 
     try:
         if args.replay:

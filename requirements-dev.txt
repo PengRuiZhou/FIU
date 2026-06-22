@@ -1,3 +1,5 @@
 # Development-only dependencies (runtime stays zero third-party).
 -r requirements.txt
 pandas>=2.0
+setuptools-rust
+
