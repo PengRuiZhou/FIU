@@ -211,31 +211,185 @@ bash deploy/stop.sh    # SIGTERM 优雅关闭，flush 最后分钟 + drain tickf
 
 ---
 
-## 架构
+## 架构与流程
+
+下列三张图共同描述 FIU 日股分钟级行情生成器的数据管线、tickfile 提交点与崩溃恢复语义。
+
+### 端到端数据管线
+
+数据线程 / 订单线程 / 时钟线程通过 SharedState 协作，tickfile-writer 后台线程串行落盘并保证崩溃可恢复。
 
 ```
-┌─ data-thread ──────┐   ┌─ clock-thread ──────┐   ┌─ order-thread ─────┐
-│ FileTailer (drain)  │   │ Flusher.tick()       │   │ FileTailer (drain)  │
-│ → parse             │   │  step1 cross-day     │   │ → parse             │
-│ → validate          │   │  step3 minute output │   │ → late detect       │
-│ → aggregate         │   │  step4 late records   │   │ → buffer            │
-│ → SharedState       │   │  step5 checkpoint     │   │ → record-driven     │
-└───────┬─────────────┘   └────────┬─────────────┘   └────────┬────────────┘
-        │                          │                           │
-        └──────────────────────────┼───────────────────────────┘
-                                   ▼
-                             SharedState (RLock)
-                                   │
-                          ┌────────┴─────────┐
-                          │ tickfile-writer   │  ← 独立后台线程，串行写每天 tickfile
-                          │ (queue + drain)   │     write_tickfile_rows: flock + sidecar
-                          └───────────────────┘     + REGEN-GUARD + _recover on restart
+┌──────────────────────────────────────────────────────────────────────────┐
+│   INPUT  (appended by upstream FIU receiver)                             │
+│   snapshot.csv.{date}      order.csv.{date}      code.csv.{date}         │
+└───────────────┬──────────────────────┬─────────────────────┬─────────────┘
+                │ snapshot+code        │ order               │
+                ▼                      ▼                     │
+┌──────────────────────────┐  ┌──────────────────────────┐  │
+│ DATA-THREAD              │  │ ORDER-THREAD             │  │
+│ FileTailer (snap+code)   │  │ FileTailer (order)       │  │
+│ ► parse ► validate       │  │ ► parse ► late-detect    │  │
+│ ► aggregate              │  │ ► buffer                 │  │
+│ ► write to SharedState   │  │ ► record + watermark     │  │
+│ ◆ Rust accel (parse)     │  │ ◆ Rust accel (parse/wr)  │  │
+└────────────┬─────────────┘  └────────────┬─────────────┘  │
+             │                             │                │
+             │  ┌──────────────────────────┴──────────┐     │
+             │  │ CLOCK-THREAD  (Flusher.tick)        │     │
+             │  │ step1 cross-day / step3 minute out  │     │
+             │  │ step4 late-records / step5 ckpt     │     │
+             │  └──────────────────┬───────────────────┘     │
+             ▼                     ▼                         │
+┌────────────────────────────────────────────────────────────┴────────┐
+│ SHAREDSTATE  (RLock)                                                │
+│  latest_snapshot │ ohlcv_buffers │ raw_snapshot_buffers             │
+│  _tickfile_pending │ _generated_tickfile_minutes (skip-set)         │
+│  _tickfile_seqno                                                    │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ pending minutes (queue)
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ TICKFILE-WRITER  (separate bg thread; per-day serialize via queue)  │
+│ ► REGEN-GUARD classify: new / append / truncate_rewrite / committed │
+│ ► write_tickfile_rows  under _get_write_lock RLock + flock (per-date)│
+│     step1 append rows ► tickfile.csv ► flush+fsync                  │
+│     step2 offset = os.fstat(fd).st_size                             │
+│     step3 append "<minute>,<offset>,<rowcount>,<seqno>" ► .commit   │
+│            ► flush+fsync  (✓ COMMIT; tickfile fsync BEFORE sidecar) │
+│ ► _recover_tickfile_to_last_commit (reads SIDECAR, not tickfile):   │
+│     max-offset = truncate anchor; tail ► .truncated.* + os.truncate │
+│     callers: flusher __init__ │ _run_tickfile_recovery │ replay.run │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+   ┌───────────────────────────┼────────────────────┬─────────────────┐
+   ▼                           ▼                    ▼                 ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐
+│ PER-MIN OUT  │  │ PER-MIN OUT  │  │ PER-MIN OUT  │  │ PER-DAY TICKFILE    │
+│ snapshot/    │  │ order/       │  │ kline/       │  │ tickfile_{D}.csv    │
+│  {Y}/{D}/    │  │  {Y}/{D}/    │  │  {Y}/{D}/    │  │  + .commit (sidecar)│
+│ snapshot_min │  │ order_minute │  │ kline_minute │  │  + .lock   (flock)  │
+└──────────────┘  └──────────────┘  └──────────────┘  └─────────────────────┘
+        checkpoint.json            tickfile/tickfile_recovery.log (audit)
+
+  ◆ = Rust acceleration point   ✓ COMMIT POINT   ✗ partial-write (recoverable)
 ```
+
+### Tickfile 提交点与崩溃恢复
+
+写提交顺序保证 sidecar fsync 严格晚于 tickfile fsync；重启时只读 sidecar 决定截断锚点并重建 skip-set。
+
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│ (A) WRITE-COMMIT SEQUENCE — write_tickfile_rows (per-date lockfile+flock) │
+│     Guard: _get_write_lock RLock  +  fcntl.flock(tickfile_{DATE}.lock)    │
+├──────────────────────────────────────────────────────────────────────────┤
+│  tickfile-writer ◄── SharedState._tickfile_pending (queue)               │
+│        ▼                                                                 │
+│   ┌──────────────────── REGEN-GUARD classify (BEFORE append) ─────────┐  │
+│   │  precondition = sidecar-last-minute vs current   AND               │  │
+│   │                tickfile-size       vs sidecar-offset               │  │
+│   │   ├─► new              ─ first minute of the day                   │  │
+│   │   ├─► append           ─ current==last+1, size==offset  ✓          │  │
+│   │   ├─► truncate_rewrite ─ size > offset (torn tail) ✗               │  │
+│   │   └─► committed-skip   ─ minute already in sidecar  ✓ (drop)       │  │
+│   └────────────────────────────────────────────────────────────────────┘  │
+│        ▼                                                                 │
+│   step1  append 65-field rows ──► tickfile_{DATE}.csv                    │
+│          flush + fsync   (tickfile durable 1st)                          │
+│   step2  offset = os.fstat(fd).st_size     ◄── durable byte anchor       │
+│   step3  append "<minute>,<offset>,<rowcount>,<seqno>"                   │
+│          ──► tickfile_{DATE}.commit (sidecar)                            │
+│          flush + fsync   ◄═══════╗ COMMIT POINT                          │
+│   step4  add minute ──► SharedState._generated_tickfile_minutes (skip)   │
+│                                                                          │
+│   INVARIANT ══════════════════════════════════════════════════════════   │
+│   sidecar has minute N  ⟺  minute N fully durable in tickfile.csv       │
+│   (sidecar fsync ALWAYS strictly AFTER tickfile fsync)                   │
+└──────────────────────────────────────────────────────────────────────────┘
+
+                              │  process restart │
+                              ▼ hard crash / stop
+┌──────────────────────────────────────────────────────────────────────────┐
+│ (B) RESTART-RECOVERY — _recover_tickfile_to_last_commit (reads SIDECAR)  │
+│     Callers: flusher __init__ (live restart) │ _run_tickfile_recovery    │
+│              (runtime: health/drain/pause) │ replay run()                │
+│     Returns: (committed_set, last_seqno, had_sidecar)                    │
+├──────────────────────────────────────────────────────────────────────────┤
+│   read tickfile_{DATE}.commit ──► committed_set + last_seqno             │
+│        ▼                                                                 │
+│   max_offset = highest offset line in sidecar  (truncate anchor)         │
+│        ▼                                                                 │
+│   ┌──────────────────────────────────────────────────┐                   │
+│   │  size == max_offset  ──► ✓ clean, nothing to do  │                   │
+│   │  size  >  max_offset ──► ✗ torn tail (partial)   │                   │
+│   │     backup tail ──► tickfile_{DATE}.truncated.*  │                   │
+│   │     os.truncate(tickfile.csv, max_offset)        │                   │
+│   │     log ──► tickfile/tickfile_recovery.log       │                   │
+│   └──────────────────────────────────────────────────┘                   │
+│        ▼                                                                 │
+│   seed SharedState._generated_tickfile_minutes ◄── committed_set (skip)  │
+│        ▼                                                                 │
+│   resume ──► engine skips committed minutes (no dup), generates only NEW │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 重启恢复场景
+
+live+live 用 truncate + skip-set 防重；live+replay 读全量源跳过已提交并补齐缺口。
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  3-FILE TICKFILE LAYOUT (per date D = YYYYMMDD)                          │
+│  tickfile/{YYYY}/{D}/                                                    │
+│    tickfile_{D}.csv       ◄── pure 65-field data rows                    │
+│    tickfile_{D}.commit    ◄── sidecar: "<minute>,<offset>,<row>,<seqno>" │
+│    tickfile_{D}.lock      ◄── fcntl.flock, 0 bytes, NEVER deleted        │
+└──────────────────────────────────────────────────────────────────────────┘
+
+   flock PER-DATE rule (lockfile = tickfile_{D}.lock):
+   ├─ different dates ► no contention (live today + replay yesterday ► safe)
+   └─ same date        ► 2nd writer ► BlockingIOError abort
+
+┌───────────────────────────[ live + live ]───────────────────────────────┐
+│  engine#1  commits 0900..0925  (csv fsync ► .commit fsync ◄ COMMIT)     │
+│  mid 0926 append: csv has rows, .commit NOT yet written  ◄── partial    │
+│  STOP / crash                                                            │
+│        on disk: tickfile_D.csv = [..0905][0910]..[0925] + 0926 partial   │
+│                  tickfile_D.commit = 0900..0925  (no 0926)               │
+│                                                                          │
+│  engine#2 (fresh) ► Flusher.__init__                                     │
+│  ► _recover_tickfile_to_last_commit (reads .commit, NOT the .csv)        │
+│      ├─ max_offset = truncate anchor                                     │
+│      ├─ csv_size > max_offset ► tail ► .truncated.* + os.truncate        │
+│      ├─ rebuild skip-set = {0900..0925}                                  │
+│      └─ last_seqno restored                                              │
+│  ► resume threads; REGEN-GUARD: 0900..0925 ► committed-skip ✓            │
+│  ► generate 0926, 0927 ...  (only NEW minutes appended)                  │
+│  RESULT ► no duplicate rows, no lost commits  ✓                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────[ live + replay ]──────────────────────────────┐
+│  live commits 0900..0925;  mid 0926 partial csv tail (no .commit line)   │
+│  STOP                                                                    │
+│        on disk: tickfile_D.csv = 0900..0925 + 0926 tail                  │
+│                  tickfile_D.commit = 0900..0925                          │
+│                                                                          │
+│  ReplayEngine.run() (reads FULL source for the date)                     │
+│  ► _recover_tickfile_to_last_commit (reads .commit)                      │
+│      ├─ max_offset = truncate anchor ► drop 0926 partial tail            │
+│      └─ skip-set = {0900..0925}                                          │
+│  ► stream source 0900 ► 0930 (full replay)                               │
+│  ► REGEN-GUARD: 0900..0925 ► committed-skip ✓  0926..0930 ► new ► append │
+│  RESULT ► no duplicate rows, gap closed  ✓                               │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 关键机制
 
 - **Data-driven watermark**：flush 时机由 `current_minute`（数据进度）决定，非真实时钟
 - **Per-minute snapshot**：分钟推进前捕获快照，carry-forward 不含未来数据
-- **Tickfile 独立 writer 线程**：串行化每天 tickfile 写入；sidecar 提交点保证崩溃一致性
-- **REGEN-GUARD**：每次 append 自愈——按 (sidecar 末行, tickfile size vs offset) 四分支决定 new/append/truncate-rewrite/committed-skip
+- **Stall-triggered flush / Double-flush 防护**：watermark 停滞自动 flush 残余；已 flush 分钟的竞态数据路由到 late queue（append 不覆盖）
 - **Drain loop / Order 独立线程**：有数据连续读，无数据走配置间隔；streaming write
 
 ---
