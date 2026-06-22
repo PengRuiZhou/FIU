@@ -886,16 +886,94 @@ def _sidecar_tail_last_record(sidecar_path: str, date: str):
     return last
 
 
+def _tickfile_last_row_minute(tickfile_path: str) -> Optional[str]:
+    """Return the minute_key of the last 65-field data row, or None. Tail-read for speed."""
+    try:
+        size = _fstat_size(tickfile_path)
+    except OSError:
+        return None
+    if size == 0:
+        return None
+    tail = min(size, TICKFILE_TAIL_READ_SIZE)
+    try:
+        with open(tickfile_path, "rb") as f:
+            f.seek(-tail, 2)
+            data = f.read()
+    except OSError:
+        return None
+    for raw in reversed(data.split(b"\n")):
+        s = raw.strip()
+        if not s:
+            continue
+        fields = s.decode("utf-8", errors="replace").split(",")
+        if len(fields) == 65:
+            mk = fields[16].replace(" ", "").replace(":", "")[:12]
+            if len(mk) == 12 and mk.isdigit():
+                return mk
+    return None
+
+
+def _find_orphan_truncate_offset(tickfile_path: str, current_minute_key: str) -> Optional[int]:
+    """When the sidecar is empty/missing: detect an ORPHANED RETRY of current_minute_key
+    (a prior write fsync'd tickfile rows but failed before the sidecar append). Returns the
+    byte offset to truncate to (just before the first current-minute row) when the current
+    minute IS the tickfile's tail row, else None (legitimate append — legacy file or normal
+    next minute; older rows must be preserved).
+
+    Closes the REGEN-GUARD 2A retry-idempotency gap created by INV-CM-ORDERED-TWO-FILE
+    (tickfile fsync strictly before sidecar commit). Minutes are append-only + monotonic, so
+    the current minute's rows are always at the tail when orphaned."""
+    if _tickfile_last_row_minute(tickfile_path) != current_minute_key:
+        return None  # current minute not at tail -> not an orphaned retry
+    offset = 0
+    try:
+        with open(tickfile_path, "rb") as f:
+            for line_num, raw in enumerate(f, start=1):
+                line_len = len(raw)
+                if line_num == 1 or not raw.strip():
+                    offset += line_len
+                    continue
+                fields = raw.decode("utf-8", errors="replace").strip().split(",")
+                if len(fields) == 65:
+                    mk = fields[16].replace(" ", "").replace(":", "")[:12]
+                    if mk == current_minute_key:
+                        return offset  # start of the first current-minute row = truncate target
+                offset += line_len
+    except OSError:
+        return None
+    return None
+
+
 def _classify_append_precondition(current_minute_key: str, sidecar_path: str, tickfile_path: str):
     """REGEN-GUARD predicate. Returns (kind, last_record):
-      ("new", None)              — sidecar missing/empty -> first write of the day.
+      ("new", None)              — sidecar missing/empty AND tickfile empty/header-only -> first write of the day.
       ("committed", last_rec)    — sidecar last minute == current AND tickfile size == offset -> skip.
-      ("append", last_rec)       — last minute <= current AND size <= offset -> clean append.
-      ("truncate_rewrite", last_rec) — tickfile size > last offset -> uncommitted residue; truncate to offset then write.
-    last_record = (minute, offset, rowcount, seqno) of sidecar's last valid line."""
+      ("append", last_rec)       — last minute <= current AND size <= offset -> clean append (also:
+                                    empty sidecar + non-empty tickfile whose tail is NOT the current
+                                    minute -> legacy file / normal next minute; older rows preserved).
+      ("truncate_rewrite", last_rec) — tickfile size > last offset -> uncommitted residue; truncate to
+                                    offset then write. Also covers REGEN 2A orphan-retry (empty sidecar
+                                    + tickfile tail == current minute): synthetic last_rec anchors the
+                                    truncate at the first current-minute row.
+    last_record = (minute, offset, rowcount, seqno) of sidecar's last valid line; for the 2A
+    orphan-retry path a synthetic (current_minute_key, orphan_offset, 0, 0) is returned."""
     last_rec = _sidecar_tail_last_record(sidecar_path, extract_date_from_minute_key(current_minute_key))
     if last_rec is None:
-        return ("new", None)
+        # No sidecar entry. Distinguish a genuine first-write from an ORPHANED RETRY (REGEN 2A):
+        # a prior write may have fsync'd tickfile rows but failed before the sidecar append,
+        # leaving committed-looking bytes with NO sidecar entry. A blind append would duplicate.
+        try:
+            tf_size = _fstat_size(tickfile_path)
+        except OSError:
+            tf_size = 0
+        if tf_size <= len(TICKFILE_HEADER) + 1:
+            return ("new", None)  # empty/header-only -> genuine first write of the day
+        orphan_offset = _find_orphan_truncate_offset(tickfile_path, current_minute_key)
+        if orphan_offset is not None:
+            # Current minute's rows already at the tail (orphaned) -> truncate them, then rewrite.
+            return ("truncate_rewrite", (current_minute_key, orphan_offset, 0, 0))
+        # Current minute absent from the tail -> legitimate append (legacy file or normal next minute).
+        return ("append", None)
     last_minute, last_offset = last_rec[0], last_rec[1]
     try:
         size = _fstat_size(tickfile_path)

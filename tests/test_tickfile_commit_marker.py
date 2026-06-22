@@ -1150,3 +1150,71 @@ def test_crossday_discards_old_date_committed_set(tmp_path, caplog):
     assert b"OLD_DATE_PARTIAL_TAIL" not in open(tf, "rb").read()
 
 
+def test_regen_2a_orphan_retry_no_duplicate(tmp_path):
+    """REGEN 2A: tickfile holds the current minute's rows but sidecar is EMPTY (a prior write
+    fsync'd rows then failed before the sidecar append). Retry must NOT duplicate."""
+    import os
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    from minute_bar.tickfile import TICKFILE_HEADER
+    from tests.test_tickfile_sync import _make_snapshot
+    date = "20260528"; mk = f"{date}0931"
+    tf = get_tickfile_path(str(tmp_path), mk)
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    # Simulate post-failure state: tickfile has R0931 (fsync'd), sidecar EMPTY (write failed).
+    fields = [""] * 65
+    fields[0] = "7203"; fields[16] = f"{date} 09:31:00"; fields[59] = "1"
+    with open(tf, "w", encoding="utf-8", newline="") as f:
+        f.write(TICKFILE_HEADER + "\n" + ",".join(fields) + "\n")
+    assert not os.path.exists(tf + ".commit")  # sidecar absent (the failure)
+    # Retry the write (the production retry path):
+    write_tickfile_rows(str(tmp_path), mk, [("7203", _make_snapshot(), None)], 1, enable_commit_marker=True)
+    # Count rows by minute:
+    import csv
+    with open(tf, newline="") as f:
+        rows = [r for r in csv.reader(f) if len(r) == 65]
+    n_0931 = sum(1 for r in rows if r[16].replace(" ", "").replace(":", "")[:12] == mk)
+    assert n_0931 == 1, f"DUPLICATE after retry: {n_0931} rows for {mk}"  # the 2A bug would give 2
+    # Sidecar now has exactly one 0931 line.
+    with open(tf + ".commit") as f:
+        sc = [l.strip() for l in f if l.strip()]
+    assert len(sc) == 1 and sc[0].startswith(mk)
+
+
+def test_regen_2a_legacy_file_new_minute_preserves_old_rows(tmp_path):
+    """sidecar empty + tickfile has OLDER minutes + writing a NEW minute -> normal append,
+    older rows PRESERVED (the fix must not truncate legacy data)."""
+    import os, csv
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    from minute_bar.tickfile import TICKFILE_HEADER
+    from tests.test_tickfile_sync import _make_snapshot
+    date = "20260528"
+    tf = get_tickfile_path(str(tmp_path), f"{date}0931")
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    # Legacy rows for 0930 + 0931, NO sidecar.
+    def row(mk_str, seq):
+        f = [""] * 65; f[0] = "7203"; f[16] = f"{date} {mk_str}:00"; f[59] = str(seq); return ",".join(f)
+    with open(tf, "w", encoding="utf-8", newline="") as f:
+        f.write(TICKFILE_HEADER + "\n" + row("09:30", 1) + "\n" + row("09:31", 2) + "\n")
+    # Write a NEW minute 0932 (not present):
+    write_tickfile_rows(str(tmp_path), f"{date}0932", [("7203", _make_snapshot(), None)], 3, enable_commit_marker=True)
+    with open(tf, newline="") as f:
+        rows = [r for r in csv.reader(f) if len(r) == 65]
+    by_min = {}
+    for r in rows:
+        k = r[16].replace(" ", "").replace(":", "")[:12]; by_min[k] = by_min.get(k, 0) + 1
+    assert by_min.get(f"{date}0930", 0) == 1, "legacy 0930 row lost!"
+    assert by_min.get(f"{date}0931", 0) == 1, "legacy 0931 row lost!"
+    assert by_min.get(f"{date}0932", 0) == 1, "new 0932 not written!"
+
+
+def test_regen_2a_genuine_first_write_still_new(tmp_path):
+    """sidecar empty + tickfile header-only/absent -> genuine 'new' (atomic-create). Not regressed."""
+    import os
+    from minute_bar.writer import write_tickfile_rows, get_tickfile_path
+    from tests.test_tickfile_sync import _make_snapshot
+    tf = get_tickfile_path(str(tmp_path), "202605280931")
+    # tickfile does not exist at all -> genuine new
+    write_tickfile_rows(str(tmp_path), "202605280931", [("7203", _make_snapshot(), None)], 1, enable_commit_marker=True)
+    assert os.path.exists(tf) and os.path.exists(tf + ".commit")
+
+
