@@ -111,6 +111,8 @@ class ReplayEngine:
             if self._generated_tickfile_minutes:
                 logger.info("Replay: %d tickfile minutes committed (had_sidecar=%s) — fill only gaps",
                             len(self._generated_tickfile_minutes), had_sidecar)
+            logger.info("Replay: recovery done skip_set=%d minutes had_sidecar=%s seqno=%d",
+                        len(self._generated_tickfile_minutes), had_sidecar, self._tickfile_seqno)
 
         write_executor = ThreadPoolExecutor(max_workers=2)
 

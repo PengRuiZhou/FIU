@@ -711,6 +711,9 @@ def _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker, has
             result = "tamper"
     if truncate_bytes > 0 and result == "fallback":
         result = "truncate"
+    logger.info("Tickfile recovery: done mode=fallback committed=%d last_seqno=%d "
+                "strip_bytes=%d result=%s",
+                len(committed_set), last_seqno, truncate_bytes, result)
     _write_recovery_audit(output_dir, date, had_sidecar=False,
                           committed_count=len(committed_set),
                           last_commit_minute=(max(committed_set) if committed_set else None),
@@ -729,13 +732,20 @@ def _recover_tickfile_to_last_commit(output_dir: str, date: str, enable_commit_m
     sidecar_path = tickfile_path + ".commit"
     lockfile_path = tickfile_path + ".lock"
 
+    logger.info("Tickfile recovery: start date=%s path=%s commit_marker=%s",
+                date, tickfile_path, enable_commit_marker)
+
     if not os.path.exists(tickfile_path):
+        logger.info("Tickfile recovery: no tickfile (fresh start) date=%s", date)
         _write_recovery_audit(output_dir, date, had_sidecar=False, committed_count=0,
                               last_commit_minute=None, truncate_bytes=0, result="noop")
         return (set(), 0, False)
 
     sidecar_records = _read_valid_sidecar(sidecar_path, date)
     has_sidecar_file = sidecar_records is not None
+    logger.info("Tickfile recovery: sidecar_records=%d had_sidecar_file=%s date=%s",
+                len(sidecar_records) if sidecar_records is not None else -1,
+                has_sidecar_file, date)
 
     # --- sidecar mode (enabled + non-empty valid records) ---
     if enable_commit_marker and sidecar_records:
@@ -750,6 +760,8 @@ def _recover_tickfile_to_last_commit(output_dir: str, date: str, enable_commit_m
                     max_offset = max_rec[1]
                     last_seqno = max_rec[3]
                     committed_set = {r[0] for r in records}
+                    logger.info("Tickfile recovery: max_offset=%d current_size=%d committed=%d last_seqno=%d",
+                                max_offset, current_size, len(committed_set), last_seqno)
                     if max_offset > current_size:                   # INV-CM-SIDECAR-OFFSET-BOUND
                         logger.critical("sidecar offset %d > tickfile size %d (%s); fallback",
                                         max_offset, current_size, tickfile_path)
@@ -763,6 +775,8 @@ def _recover_tickfile_to_last_commit(output_dir: str, date: str, enable_commit_m
                         os.truncate(tickfile_path, max_offset)      # path-based, atomic; FAIL-ATOMIC-safe
                         truncate_bytes = current_size - max_offset
                         result = "truncate"
+                        logger.info("Tickfile recovery: truncated %d bytes (partial tail) -> offset=%d",
+                                    truncate_bytes, max_offset)
                 except _FallbackSignal:
                     return _fallback_recover(output_dir, tickfile_path, date, enable_commit_marker,
                                              has_sidecar_file, "fallback")
@@ -777,6 +791,9 @@ def _recover_tickfile_to_last_commit(output_dir: str, date: str, enable_commit_m
                                       last_commit_minute=max_rec[0],
                                       truncate_bytes=truncate_bytes, result=result)
                 _prune_truncated_backups(tickfile_path)  # INV-CM-RETENTION (best-effort)
+                logger.info("Tickfile recovery: done mode=sidecar committed=%d last_seqno=%d "
+                            "had_sidecar=True truncate_bytes=%d",
+                            len(committed_set), last_seqno, truncate_bytes)
                 return (committed_set, last_seqno, True)
 
     # --- fallback path (lock-protected: INV-CM-LOCK) ---

@@ -100,6 +100,8 @@ class ClockWatermarkFlusher:
                                len(committed_set))
             # INV-CM-SEQNO-MONO-FILE: never regress.
             self._state._tickfile_seqno = max(self._state._tickfile_seqno, last_seqno)
+            logger.info("Tickfile init recovery: skip_set+=%d minutes seqno=%d had_sidecar=%s",
+                        len(committed_set), self._state._tickfile_seqno, had_sidecar)
             # INV-CM-RECONCILE-THREE-WAY: detection only (gap-injection deferred).
             self._reconcile_tickfile(committed_set)
 
@@ -280,6 +282,7 @@ class ClockWatermarkFlusher:
         old_date = self._state.last_output_date
         if old_date and old_date != current_date:
             from minute_bar.writer import _recover_tickfile_to_last_commit
+            logger.info("Cross-day old-date recovery: date=%s", old_date)
             try:
                 _recover_tickfile_to_last_commit(
                     self._output_dir, old_date,
@@ -628,6 +631,8 @@ class ClockWatermarkFlusher:
             with self._state.lock:
                 self._state._generated_tickfile_minutes |= committed_set
                 self._state._tickfile_seqno = max(self._state._tickfile_seqno, last_seqno)
+                logger.info("Tickfile runtime recovery: skip_set+=%d minutes seqno=%d had_sidecar=%s",
+                            len(committed_set), self._state._tickfile_seqno, had_sidecar)
         # INV-CM-RECONCILE-THREE-WAY: detection only (gap-injection deferred).
         # Run regardless of had_sidecar/committed_set so an empty tickfile vs.
         # non-empty snapshot/order is also caught.

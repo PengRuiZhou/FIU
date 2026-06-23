@@ -411,6 +411,7 @@ class Engine:
             self.stop()
 
     def stop(self) -> None:
+        logger.info("Engine stop: beginning graceful shutdown")
         self._running = False
         join_errors = []
         flush_error = None
@@ -555,6 +556,7 @@ class Engine:
                             self._total_late_order_dropped,
                             self._max_late_order_records,
                         )
+                    logger.info("Engine stop: tickfile writer drained + finalized")
             else:
                 # No writer or not started — still flush remaining
                 try:

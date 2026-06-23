@@ -84,6 +84,7 @@ class LoggingConfig:
     max_file_size_mb: int = 100
     max_backup_count: int = 5
     log_level: str = "INFO"
+    structured: bool = False  # emit file-handler logs as JSON lines (machine-parseable)
 
 
 @dataclass
@@ -173,6 +174,7 @@ def load_config(path: str | Path) -> AppConfig:
         cfg.logging.max_file_size_mb = s.getint("max_file_size_mb", cfg.logging.max_file_size_mb)
         cfg.logging.max_backup_count = s.getint("max_backup_count", cfg.logging.max_backup_count)
         cfg.logging.log_level = s.get("log_level", cfg.logging.log_level)
+        cfg.logging.structured = s.getboolean("structured", cfg.logging.structured)
 
     if not cfg.input.csv_dir:
         raise ValueError("config [input] csv_dir is required")

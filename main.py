@@ -56,7 +56,11 @@ def setup_logging(config) -> None:
             backupCount=config.logging.max_backup_count,
             encoding="utf-8",
         )
-        file_handler.setFormatter(formatter)
+        if config.logging.structured:
+            from minute_bar.log_json import JsonFormatter
+            file_handler.setFormatter(JsonFormatter())
+        else:
+            file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
 
 
