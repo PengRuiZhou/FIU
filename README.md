@@ -71,7 +71,7 @@ CLI 参数：
 
 ```bash
 # 终端 1：启动 minute_bar（live）
-PYTHONPATH=src python main.py --config config/test-order-live.ini
+PYTHONPATH=src python main.py --config config/test.ini
 
 # 终端 2：启动模拟器（100 倍速，保留乱序 + 半行 + late record）
 PYTHONPATH=src python -m data_simulator --speed 100 --file-types order,snapshot,code \
