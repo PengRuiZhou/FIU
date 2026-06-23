@@ -49,6 +49,7 @@ def setup_logging(config) -> None:
     if log_dir:
         from datetime import datetime
         date_str = datetime.now().strftime("%Y%m%d")
+        # Human-readable run log — ALWAYS mirrors stdout (console) for human reading.
         log_file = os.path.join(log_dir, f"{date_str}_errors.log")
         file_handler = logging.handlers.RotatingFileHandler(
             log_file,
@@ -56,12 +57,22 @@ def setup_logging(config) -> None:
             backupCount=config.logging.max_backup_count,
             encoding="utf-8",
         )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+        # Optional machine-readable JSON log (IN ADDITION to the human log) for
+        # monitoring/jq. structured=true no longer sacrifices human readability.
         if config.logging.structured:
             from minute_bar.log_json import JsonFormatter
-            file_handler.setFormatter(JsonFormatter())
-        else:
-            file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
+            json_log = os.path.join(log_dir, f"{date_str}_machine.jsonl")
+            json_handler = logging.handlers.RotatingFileHandler(
+                json_log,
+                maxBytes=config.logging.max_file_size_mb * 1024 * 1024,
+                backupCount=config.logging.max_backup_count,
+                encoding="utf-8",
+            )
+            json_handler.setFormatter(JsonFormatter())
+            root_logger.addHandler(json_handler)
 
 
 def main() -> None:

@@ -17,6 +17,8 @@ class JsonFormatter(logging.Formatter):
         "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
         "created", "msecs", "relativeCreated", "thread", "threadName",
         "processName", "process", "taskName", "getMessage",
+        # attrs a sibling human Formatter may stamp onto the shared record:
+        "message", "asctime",
     })
 
     def format(self, record: logging.LogRecord) -> str:
