@@ -34,6 +34,28 @@ chmod +x "${APP_DIR}/deploy/restart.sh"
 echo "Verifying Python..."
 ${PYTHON} -c "import sys; print(f'Python {sys.version}')"
 
+# 4b. Ensure Rust toolchain (cargo/rustc) — required by setuptools-rust to build _order_accel
+echo "Ensuring Rust toolchain..."
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo not found — installing via rustup (minimal profile)..."
+    # order_accel/rust-toolchain.toml locks channel 1.84 (+ rustfmt/clippy);
+    # rustup auto-fetches it on first `cargo build`.
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+        || { echo "ERROR: rustup install failed"; exit 1; }
+    # shellcheck disable=SC1090
+    source "${HOME}/.cargo/env"
+    echo "Installed: $(cargo --version)"
+else
+    echo "Using existing: $(cargo --version)"
+fi
+# C linker is required by rustc on Linux
+if ! command -v cc >/dev/null 2>&1; then
+    echo "ERROR: C linker 'cc' not found. Install gcc and re-run:" >&2
+    echo "    RHEL/CentOS: sudo yum install -y gcc" >&2
+    echo "    Debian/Ubuntu: sudo apt install -y gcc" >&2
+    exit 1
+fi
+
 # 5. Build Rust extension (_order_accel) — engine imports minute_bar._order_accel
 echo "Building Rust extension (_order_accel)..."
 pip install setuptools-rust || { echo "ERROR: setuptools-rust install failed"; exit 1; }
