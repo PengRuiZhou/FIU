@@ -1,0 +1,5 @@
+# Normalize line endings.
+# Shell scripts MUST be LF — CRLF breaks bash on Linux (`set: pipefail: invalid option`).
+*.sh  text eol=lf
+*.py  text eol=lf
+*.ini text eol=lf

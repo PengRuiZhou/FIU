@@ -4,7 +4,23 @@ set -euo pipefail
 
 APP_DIR="/home/rpeng/fiu_minute_bar"
 DATA_DIR="/home/rpeng/fiu_minute_bar"
-PYTHON="/home/prod/anaconda3/bin/python"
+
+# --- Activate conda env so python/pip resolve to the project env ---
+# Override with: CONDA_BASE=... CONDA_ENV=... bash deploy/setup.sh
+CONDA_BASE="${CONDA_BASE:-/home/prod/anaconda3}"
+CONDA_ENV="${CONDA_ENV:-fiu_env}"
+if [[ -f "${CONDA_BASE}/bin/activate" ]]; then
+    # conda's activate script references unbound vars; relax `set -u` temporarily.
+    set +u
+    # shellcheck disable=SC1091
+    source "${CONDA_BASE}/bin/activate" || { echo "ERROR: sourcing ${CONDA_BASE}/bin/activate failed" >&2; exit 1; }
+    conda activate "${CONDA_ENV}" || { echo "ERROR: conda activate ${CONDA_ENV} failed (run: conda env list)" >&2; exit 1; }
+    set -u
+else
+    echo "WARNING: ${CONDA_BASE}/bin/activate not found — falling back to PATH python" >&2
+fi
+# Interpreter after activation (override with $PYTHON to pin a specific one).
+PYTHON="${PYTHON:-$(command -v python)}"
 
 echo "=== FIU Minute Bar Generator — Production Setup ==="
 
@@ -58,8 +74,8 @@ fi
 
 # 5. Build Rust extension (_order_accel) — engine imports minute_bar._order_accel
 echo "Building Rust extension (_order_accel)..."
-pip install setuptools-rust || { echo "ERROR: setuptools-rust install failed"; exit 1; }
-pip install . || { echo "ERROR: Rust extension build failed (pip install .)"; exit 1; }
+${PYTHON} -m pip install setuptools-rust || { echo "ERROR: setuptools-rust install failed"; exit 1; }
+${PYTHON} -m pip install . || { echo "ERROR: Rust extension build failed (pip install .)"; exit 1; }
 PYTHONPATH=src ${PYTHON} -c "from minute_bar import _order_accel; print('Rust ext OK')" || { echo "ERROR: _order_accel not importable after build"; exit 1; }
 
 # 6. Verify config
